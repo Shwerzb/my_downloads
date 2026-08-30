@@ -555,15 +555,16 @@ foreach ($app in $Software) {
 # -----------------------------------------------------------------------------
 # 7. Chrome kiosk policy  (DISPATCHER ONLY)
 # -----------------------------------------------------------------------------
-Write-Banner "5. Chrome kiosk lockdown (dispatcher only)"
-Invoke-Step "Apply Chrome policy to $DispatcherUser" {
-    if (-not $DispSid) { throw "dispatcher SID not found" }
+Write-Banner "5. Chrome kiosk lockdown (machine-wide)"
+Invoke-Step "Apply Chrome kiosk policy (machine-wide)" {
     Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-    Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
-        param($root)
-        $base = "$root\Software\Policies\Google\Chrome"
-        New-Item -Path $base -Force | Out-Null
+    # Machine-wide (HKLM) so Chrome ALWAYS enforces it -- in any session, and even
+    # if the dispatcher lands on a temporary profile. Berish's Chrome is governed
+    # by this too; Berish browses unrestricted via Edge (Edge is blocked only for
+    # the dispatcher).
+    $base = "HKLM:\SOFTWARE\Policies\Google\Chrome"
+    New-Item -Path $base -Force | Out-Null
 
         # Allowlist
         $allow = "$base\URLAllowlist"
@@ -618,7 +619,6 @@ Invoke-Step "Apply Chrome policy to $DispatcherUser" {
             $j = 1
             foreach ($u in $ChromeSitePermissionUrls) { Set-RegValue $kp "$j" String $u; $j++ }
         }
-    }
 }
 
 # -----------------------------------------------------------------------------
