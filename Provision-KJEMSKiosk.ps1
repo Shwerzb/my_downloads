@@ -325,8 +325,14 @@ Write-Banner "KJ EMS Kiosk Provisioning   |   $(Get-Date -Format 'yyyy-MM-dd HH:
 Write-Host   "  Log file: $LogFile" -ForegroundColor DarkGray
 Write-Host   ""
 
-# Ask for the admin password now (typed twice, hidden, never written to the log/file)
-$AdminSecurePassword = Read-NewPassword "  Enter a password for the admin account '$AdminUser'"
+# Ask for the admin password only if the admin account doesn't already exist
+# (typed twice, hidden, never written to the log/file)
+if (Get-LocalUser -Name $AdminUser -ErrorAction SilentlyContinue) {
+    $AdminSecurePassword = $null
+    Write-Host ("  Admin account '{0}' already exists -- keeping its current password." -f $AdminUser) -ForegroundColor Yellow
+} else {
+    $AdminSecurePassword = Read-NewPassword "  Enter a password for the new admin account '$AdminUser'"
+}
 
 # -----------------------------------------------------------------------------
 # 1. Relax password policy
@@ -381,7 +387,11 @@ Invoke-Step "Create dispatcher account '$DispatcherUser'" {
 # -----------------------------------------------------------------------------
 Invoke-Step "Apply passwords + never-expires" {
     if (Get-LocalUser -Name $AdminUser -ErrorAction SilentlyContinue) {
-        Set-LocalUser -Name $AdminUser -Password $AdminSecurePassword -PasswordNeverExpires $true -ErrorAction Stop
+        if ($AdminSecurePassword) {
+            Set-LocalUser -Name $AdminUser -Password $AdminSecurePassword -PasswordNeverExpires $true -ErrorAction Stop
+        } else {
+            Set-LocalUser -Name $AdminUser -PasswordNeverExpires $true -ErrorAction Stop
+        }
     }
     if (Get-LocalUser -Name $DispatcherUser -ErrorAction SilentlyContinue) {
         if ([string]::IsNullOrEmpty($DispatcherPassword)) {
