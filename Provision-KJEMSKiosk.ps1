@@ -188,7 +188,8 @@ $Software = @(
 $ScriptDir     = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $InstallersDir = Join-Path $ScriptDir "Installers"
 $BookmarksSrc  = Join-Path $ScriptDir "Bookmarks"              # Chrome Bookmarks JSON file (optional)
-$WallpaperSrc  = Join-Path $ScriptDir "wallpaper-noclock.png"  # desktop + lock screen image (optional)
+$WallpaperSrc  = Join-Path $ScriptDir "wallpaper-noclock.png"  # desktop + lock screen image
+$WallpaperUrl  = "https://raw.githubusercontent.com/Shwerzb/my_downloads/main/wallpaper-noclock.png"  # auto-downloaded if missing
 $LogDir        = "C:\ProgramData\KJEMS"
 
 # =============================================================================
@@ -633,7 +634,16 @@ Invoke-Step "Disable Windows 11 widgets" {
 }
 
 Invoke-Step "Set EMS desktop + lock screen wallpaper" {
-    if (-not (Test-Path $WallpaperSrc)) { Skip-Step "no wallpaper file next to script" }
+    # Download the wallpaper if it isn't sitting next to the script
+    if (-not (Test-Path $WallpaperSrc) -and $WallpaperUrl) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+            Invoke-WebRequest -Uri $WallpaperUrl -OutFile $WallpaperSrc -UseBasicParsing -ErrorAction Stop
+        } catch {
+            & curl.exe -L $WallpaperUrl -o $WallpaperSrc 2>$null
+        }
+    }
+    if (-not (Test-Path $WallpaperSrc)) { Skip-Step "wallpaper not found and download failed" }
     Copy-Item $WallpaperSrc $WallpaperDest -Force
 
     # Lock screen for ALL users (machine policy)
