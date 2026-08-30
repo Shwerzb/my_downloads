@@ -131,6 +131,14 @@ $ChromeSitePermissionUrls = @(
     "[*.]teamconnectapp.com"
 )
 
+# Chrome web shortcuts placed on the dispatcher's desktop (name -> URL)
+$DesktopShortcuts = @(
+    @{ Name = "Hatzalah Web"; Url = "https://hatzalahweb.datavanced.com" },
+    @{ Name = "Team Connect"; Url = "https://www.teamconnectapp.com" },
+    @{ Name = "Maps";         Url = "https://www.google.com/maps" },
+    @{ Name = "PCR";          Url = "https://www.creativeemssolutions.com" }   # <-- set your real PCR URL
+)
+
 # ---- Dispatcher blocked apps -------------------------------------------------
 # The dispatcher is BLOCKED from launching these executables (matched by file
 # name). A blocklist keeps the Windows shell fully working (taskbar, volume,
@@ -972,6 +980,33 @@ Invoke-Step "Add Volume Control shortcut to dispatcher desktop" {
     $sc.IconLocation     = "$env:windir\System32\SndVol.exe,0"
     $sc.Description       = "Volume Control"
     $sc.Save()
+}
+
+Invoke-Step "Create dispatcher web shortcuts (Hatzalah, Team Connect, Maps, PCR)" {
+    $chrome = @(
+        "C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $chrome) { Skip-Step "Chrome not installed" }
+
+    $desktop = Join-Path $DispProfile "Desktop"
+    if (-not (Test-Path $desktop)) { New-Item -Path $desktop -ItemType Directory -Force | Out-Null }
+
+    $sh = New-Object -ComObject WScript.Shell
+    $made = @()
+    foreach ($s in $DesktopShortcuts) {
+        if (-not $s.Url) { continue }
+        $lnk = Join-Path $desktop ("{0}.lnk" -f $s.Name)
+        $sc = $sh.CreateShortcut($lnk)
+        $sc.TargetPath       = $chrome
+        $sc.Arguments        = ('--new-window "{0}"' -f $s.Url)
+        $sc.WorkingDirectory = Split-Path $chrome
+        $sc.IconLocation     = "$chrome,0"
+        $sc.Description       = $s.Name
+        $sc.Save()
+        $made += $s.Name
+    }
+    "created: " + ($made -join ", ")
 }
 
 Invoke-Step "Set dispatcher startup apps (Chrome, Lexip)" {
