@@ -842,8 +842,9 @@ Invoke-Step "Add Volume Control shortcut to dispatcher desktop" {
     $sc.Save()
 }
 
-Invoke-Step "Set dispatcher startup apps (Chrome, Lexip)" {
+Invoke-Step "Set dispatcher startup apps (Chrome, Lexip, Jabra)" {
     if (-not $DispSid) { throw "dispatcher SID not found" }
+    # (Bria starts via its own logon scheduled task, registered further below.)
 
     # Chrome exe
     $chrome = @(
@@ -865,21 +866,39 @@ Invoke-Step "Set dispatcher startup apps (Chrome, Lexip)" {
         }
     }
 
+    # Jabra Direct exe -- search the Jabra install folder, then fall back to uninstall info
+    $jabra = Get-ChildItem "C:\Program Files\Jabra","C:\Program Files (x86)\Jabra" `
+                -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+             Where-Object { $_.BaseName -match 'Jabra.?Direct' } |
+             Select-Object -First 1 -ExpandProperty FullName
+    if (-not $jabra) {
+        $ji = Get-UninstallInfo "Jabra Direct"
+        if ($ji -and $ji.DisplayIcon) {
+            $jc = ($ji.DisplayIcon -replace ',\s*\d+\s*$','').Trim('"')
+            if ($jc -and (Test-Path $jc)) { $jabra = $jc }
+        }
+    }
+
     $script:_StartChrome = $chrome
     $script:_StartLexip  = $lexip
+    $script:_StartJabra  = $jabra
 
-    # Register both under the dispatcher's per-user Run key (starts them at that
-    # user's login; Chrome opens the kiosk URL via the RestoreOnStartup policy)
+    # Register under the dispatcher's per-user Run key (starts them at that user's
+    # login; Chrome opens the kiosk URL via the RestoreOnStartup policy)
     Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
         param($root)
         $run = "$root\Software\Microsoft\Windows\CurrentVersion\Run"
         if (-not (Test-Path $run)) { New-Item -Path $run -Force | Out-Null }
         if ($script:_StartChrome) { Set-RegValue $run "GoogleChrome" String ('"{0}"' -f $script:_StartChrome) }
         if ($script:_StartLexip)  { Set-RegValue $run "LexipControl" String ('"{0}"' -f $script:_StartLexip) }
+        if ($script:_StartJabra)  { Set-RegValue $run "JabraDirect"  String ('"{0}"' -f $script:_StartJabra) }
     }
 
     if (-not $chrome) { throw "Chrome not installed -- cannot start it at login" }
-    if (-not $lexip)  { "Chrome start set; Lexip exe not found (install Lexip first)" }
+    $missing = @()
+    if (-not $lexip) { $missing += "Lexip" }
+    if (-not $jabra) { $missing += "Jabra" }
+    if ($missing.Count) { "Chrome start set; not found (install first): " + ($missing -join ", ") }
 }
 
 Invoke-Step "Pin Chrome + Bria to the taskbar (dispatcher)" {
