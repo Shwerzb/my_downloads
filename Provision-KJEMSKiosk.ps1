@@ -640,24 +640,27 @@ Invoke-Step "Import Chrome bookmarks" {
 # -----------------------------------------------------------------------------
 Write-Banner "6. Desktop hardening"
 Invoke-Step "Disable Windows 11 widgets" {
-    # Machine-wide policy disables the widgets board + lock-screen widgets for
-    # everyone -- this is what actually turns widgets off.
-    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests"      DWord 0
-    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "DisableWidgetsOnLockScreen" DWord 1
-    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "DisableWidgetsBoard"        DWord 1
-
-    # Per-user taskbar button is cosmetic on top of the above -- best-effort so a
-    # transient hive hiccup can't fail the whole step.
+    # Machine-wide policy disables the widgets board + lock-screen widgets.
+    # Best-effort: on Intune/MDM-managed devices the Dsh policy key can be locked
+    # ("unauthorized operation"), which must not fail the whole step.
+    $notes = @()
+    foreach ($v in @(
+        @{ N="AllowNewsAndInterests"; V=0 },
+        @{ N="DisableWidgetsOnLockScreen"; V=1 },
+        @{ N="DisableWidgetsBoard"; V=1 })) {
+        try { Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" $v.N DWord $v.V }
+        catch { $notes += $v.N }
+    }
+    # Per-user taskbar button
     if ($DispSid) {
         try {
             Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
                 param($root)
                 Set-RegValue "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" DWord 0
             }
-        } catch {
-            "widgets disabled machine-wide; taskbar-button tweak skipped ($($_.Exception.Message))"
-        }
+        } catch { $notes += "TaskbarDa" }
     }
+    if ($notes.Count) { "some keys locked (likely Intune/MDM), skipped: " + ($notes -join ", ") }
 }
 
 Invoke-Step "Set EMS desktop + lock screen wallpaper" {
