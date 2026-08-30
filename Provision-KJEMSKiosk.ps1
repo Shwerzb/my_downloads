@@ -69,9 +69,13 @@ if (-not $__isAdmin) {
 # =============================================================================
 
 # ---- Accounts ---------------------------------------------------------------
-$DispatcherUser     = "kioskUser0"
+$DispatcherUser     = "kioskUser1"        # dispatcher account (fresh name; was kioskUser0)
 $DispatcherPassword = ""                  # blank = dispatcher logs in with NO password
 $DispatcherFullName = "Dispatcher"
+
+# Old dispatcher accounts to FULLY delete on every run (account + all profiles/
+# folders/ProfileList entries). Migrating off the ManageEngine-tainted kioskUser0.
+$LegacyDispatcherUsers = @("kioskUser0")
 
 $AdminUser          = "Berish"           # local admin account name
 $AdminFullName      = "Berish"
@@ -345,6 +349,31 @@ function Get-UninstallInfo {
     return $null
 }
 
+# Completely remove a local account: the account itself + every profile
+# (incl. orphaned/temp), its ProfileList entry, and its C:\Users folder(s).
+function Remove-UserAndProfiles {
+    param([string]$Name)
+    if (-not $Name) { return }
+    $live = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+        Where-Object { $_.Loaded -and $_.LocalPath -like "C:\Users\$Name*" }
+    if ($live) { throw "$Name is signed in -- sign it out, then re-run" }
+
+    if (Get-LocalUser -Name $Name -ErrorAction SilentlyContinue) {
+        Remove-LocalUser -Name $Name -ErrorAction SilentlyContinue
+    }
+    Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPath -like "C:\Users\$Name*" } |
+        ForEach-Object { Remove-CimInstance -InputObject $_ -ErrorAction SilentlyContinue }
+    $pl = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+    Get-ChildItem $pl | ForEach-Object {
+        $img = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+        if ($img -like "C:\Users\$Name*") { Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "$Name*" } |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 function Test-AppInstalled {
     param([string]$NamePattern)
     $keys = @(
@@ -425,36 +454,22 @@ Invoke-Step "Remove leftover Local Group Policy (old ADMX / ManageEngine)" {
 # -----------------------------------------------------------------------------
 Write-Banner "2. Local accounts"
 
+Invoke-Step "Remove legacy dispatcher account(s)" {
+    $done = @()
+    foreach ($u in $LegacyDispatcherUsers) {
+        if (-not $u -or $u -eq $DispatcherUser) { continue }
+        $exists = (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) -or
+                  (Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "$u*" })
+        if ($exists) { Remove-UserAndProfiles $u; $done += $u }
+    }
+    if (-not $done.Count) { Skip-Step "no legacy accounts present" }
+    "fully removed: " + ($done -join ", ")
+}
+
 Invoke-Step "Deep-clean dispatcher profile (-ResetDispatcher)" {
     if (-not $ResetDispatcher) { Skip-Step "not requested" }
-
-    # Never run while the dispatcher is signed in
-    $live = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
-        Where-Object { $_.Loaded -and $_.LocalPath -like "C:\Users\$DispatcherUser*" }
-    if ($live) { throw "dispatcher is signed in -- sign it out, then re-run" }
-
-    # Delete the account so it is recreated with a single, clean profile
-    if (Get-LocalUser -Name $DispatcherUser -ErrorAction SilentlyContinue) {
-        Remove-LocalUser -Name $DispatcherUser -ErrorAction SilentlyContinue
-    }
-
-    # Remove EVERY profile for this user (including orphaned/temp ones left by
-    # past resets), plus its ProfileList entry and folder.
-    Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
-        Where-Object { $_.LocalPath -like "C:\Users\$DispatcherUser*" } |
-        ForEach-Object { Remove-CimInstance -InputObject $_ -ErrorAction SilentlyContinue }
-
-    $pl = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
-    Get-ChildItem $pl | ForEach-Object {
-        $img = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
-        if ($img -like "C:\Users\$DispatcherUser*") { Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-
-    Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like "$DispatcherUser*" } |
-        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-
-    "purged the account + all '$DispatcherUser' profiles/folders/ProfileList entries -- a clean profile is created next"
+    Remove-UserAndProfiles $DispatcherUser
+    "purged '$DispatcherUser' account + all its profiles/folders/ProfileList entries -- a clean profile is created next"
 }
 
 Invoke-Step "Create admin account '$AdminUser'" {
