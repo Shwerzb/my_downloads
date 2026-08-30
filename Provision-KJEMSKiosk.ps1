@@ -36,6 +36,13 @@
 ===============================================================================
 #>
 
+param(
+    # Delete the dispatcher profile first so it is recreated fresh (taskbar / Start
+    # pins reliably apply only to a brand-new profile). The dispatcher must be
+    # signed out. The account itself is kept.
+    [switch]$ResetDispatcher
+)
+
 # ---------------------------------------------------------------------------
 #  Self-elevate: relaunch as Administrator (UAC prompt) if not already elevated
 # ---------------------------------------------------------------------------
@@ -47,9 +54,9 @@ if (-not $__isAdmin) {
     }
     Write-Host "Requesting administrator rights -- approve the UAC prompt..." -ForegroundColor Yellow
     try {
-        Start-Process -FilePath "$PSHOME\powershell.exe" -Verb RunAs -ArgumentList @(
-            "-NoExit","-NoProfile","-ExecutionPolicy","Bypass","-File","`"$PSCommandPath`""
-        )
+        $relaunchArgs = @("-NoExit","-NoProfile","-ExecutionPolicy","Bypass","-File","`"$PSCommandPath`"")
+        if ($ResetDispatcher) { $relaunchArgs += "-ResetDispatcher" }
+        Start-Process -FilePath "$PSHOME\powershell.exe" -Verb RunAs -ArgumentList $relaunchArgs
     } catch {
         Write-Host "Elevation was cancelled -- the script did not run." -ForegroundColor Red
         exit 1
@@ -117,6 +124,12 @@ $ChromeAllowedSites = @(
 )
 
 $ChromeWebStoreUpdateUrl = "https://clients2.google.com/service/update2/crx"
+
+# Sites granted Location (geolocation) + Pop-up permission in the dispatcher Chrome
+$ChromeSitePermissionUrls = @(
+    "hatzalahweb.datavanced.com",
+    "[*.]teamconnectapp.com"
+)
 
 # ---- Dispatcher blocked apps -------------------------------------------------
 # The dispatcher is BLOCKED from launching these executables (matched by file
@@ -425,6 +438,26 @@ Invoke-Step "Apply passwords + never-expires" {
 # 5. Materialize dispatcher profile on disk (no interactive logon needed)
 # -----------------------------------------------------------------------------
 Write-Banner "3. Dispatcher profile"
+
+Invoke-Step "Reset dispatcher profile (-ResetDispatcher)" {
+    if (-not $ResetDispatcher) { Skip-Step "not requested" }
+    $sid = $null
+    try { $sid = Get-UserSid $DispatcherUser } catch {}
+    if (-not $sid) { Skip-Step "dispatcher account not found" }
+
+    $prof = Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue
+    if ($prof -and $prof.Loaded) { throw "dispatcher is signed in -- sign it out, then re-run" }
+
+    if ($prof) {
+        Remove-CimInstance -InputObject $prof -ErrorAction Stop
+        "deleted profile for $DispatcherUser -- it will be recreated fresh"
+    } else {
+        $p = Join-Path "C:\Users" $DispatcherUser
+        if (Test-Path $p) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
+        "no registered profile; cleaned any leftover folder"
+    }
+}
+
 Invoke-Step "Create dispatcher profile on disk" {
     $sid = Get-UserSid $DispatcherUser
     $profileDir = Join-Path "C:\Users" $DispatcherUser
@@ -547,6 +580,16 @@ Invoke-Step "Apply Chrome policy to $DispatcherUser" {
         Set-RegValue $base "AutofillAddressEnabled"     DWord 0
         Set-RegValue $base "AutofillCreditCardEnabled"  DWord 0
         Set-RegValue $base "TaskManagerEndProcessEnabled" DWord 0
+        Set-RegValue $base "DefaultBrowserSettingEnabled"  DWord 0   # no "make Chrome default" prompt
+
+        # Per-site permissions: allow Location + Pop-ups for the EMS sites
+        foreach ($permKey in @("GeolocationAllowedForUrls","PreciseGeolocationAllowedForUrls","PopupsAllowedForUrls")) {
+            $kp = "$base\$permKey"
+            Remove-Item -Path $kp -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -Path $kp -Force | Out-Null
+            $j = 1
+            foreach ($u in $ChromeSitePermissionUrls) { Set-RegValue $kp "$j" String $u; $j++ }
+        }
     }
 }
 
@@ -707,17 +750,16 @@ Invoke-Step "Set Chrome as default browser" {
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $chrome) { Skip-Step "Chrome not installed" }
 
-    # Windows only honors default-browser changes via machine default associations
+    # Windows only honors default-app changes via machine default associations.
+    # Set Chrome for every web protocol + file type it handles.
     $xml = Join-Path $LogDir "kjems-default-apps.xml"
-    Set-Content -Path $xml -Encoding UTF8 -Force -Value @(
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<DefaultAssociations>',
-        '  <Association Identifier="http"  ProgId="ChromeHTML" ApplicationName="Google Chrome" />',
-        '  <Association Identifier="https" ProgId="ChromeHTML" ApplicationName="Google Chrome" />',
-        '  <Association Identifier=".htm"  ProgId="ChromeHTML" ApplicationName="Google Chrome" />',
-        '  <Association Identifier=".html" ProgId="ChromeHTML" ApplicationName="Google Chrome" />',
-        '</DefaultAssociations>'
-    )
+    $assoc = @('<?xml version="1.0" encoding="UTF-8"?>','<DefaultAssociations>')
+    foreach ($id in @("http","https","ftp","mailto",
+                      ".htm",".html",".shtml",".xht",".xhtml",".svg",".webp",".pdf",".mhtml")) {
+        $assoc += ('  <Association Identifier="{0}" ProgId="ChromeHTML" ApplicationName="Google Chrome" />' -f $id)
+    }
+    $assoc += '</DefaultAssociations>'
+    Set-Content -Path $xml -Encoding UTF8 -Force -Value $assoc
     & dism.exe /Online /Import-DefaultAppAssociations:"$xml" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DISM import failed (exit $LASTEXITCODE)" }
     "applies at the dispatcher's next fresh login"
