@@ -14,7 +14,9 @@
    7.  Apply the Chrome kiosk policy (allow/block list, extensions, hardening)
        to the DISPATCHER ONLY  -- the admin keeps a normal Chrome
    8.  Import Chrome bookmarks
-   9.  Disable Windows 11 widgets
+   9.  Disable Windows 11 widgets, set wallpaper/lock screen
+   9b. Block Edge for the dispatcher + kill Microsoft first-login prompts
+       ("finish setting up your device", privacy screen, tips, suggested apps)
    10. Disable Google / Edge / OneDrive updaters
    11. Dispatcher desktop lockdown (settings visibility, OneDrive off,
        recycle bin hidden, volume shortcut, startup programs)
@@ -274,6 +276,32 @@ function Read-NewPassword {
     }
 }
 
+function Ensure-Shortcut {
+    param([string]$Exe,[string]$Name)
+    $dir = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs"
+    $lnk = Join-Path $dir "$Name.lnk"
+    if (-not (Test-Path $lnk)) {
+        $sh = New-Object -ComObject WScript.Shell
+        $sc = $sh.CreateShortcut($lnk)
+        $sc.TargetPath       = $Exe
+        $sc.WorkingDirectory = Split-Path $Exe
+        $sc.Save()
+    }
+    return $lnk
+}
+
+function Get-UninstallInfo {
+    param([string]$NamePattern)
+    foreach ($k in @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*")) {
+        $hit = Get-ItemProperty $k -ErrorAction SilentlyContinue |
+               Where-Object { $_.DisplayName -like "*$NamePattern*" } | Select-Object -First 1
+        if ($hit) { return $hit }
+    }
+    return $null
+}
+
 function Test-AppInstalled {
     param([string]$NamePattern)
     $keys = @(
@@ -292,6 +320,7 @@ function Test-AppInstalled {
 # =============================================================================
 #  START
 # =============================================================================
+try { $Host.UI.RawUI.BackgroundColor = 'Black'; $Host.UI.RawUI.ForegroundColor = 'Gray'; Clear-Host } catch {}
 Write-Banner "KJ EMS Kiosk Provisioning   |   $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
 Write-Host   "  Log file: $LogFile" -ForegroundColor DarkGray
 Write-Host   ""
@@ -534,6 +563,126 @@ Invoke-Step "Set EMS desktop + lock screen wallpaper" {
     }
 }
 
+Invoke-Step "Suppress Microsoft first-login prompts & suggestions" {
+    # Machine-wide: skip the OOBE privacy screen, no first-logon animation,
+    # kill consumer/cloud "suggested" content and web search in Start
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE" "DisablePrivacyExperience" DWord 1
+    Set-RegValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "EnableFirstLogonAnimation" DWord 0
+    $cc = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent"
+    Set-RegValue $cc "DisableWindowsConsumerFeatures"     DWord 1
+    Set-RegValue $cc "DisableConsumerAccountStateContent" DWord 1
+    Set-RegValue $cc "DisableCloudOptimizedContent"       DWord 1
+    Set-RegValue $cc "DisableSoftLanding"                 DWord 1
+    $ws = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search"
+    Set-RegValue $ws "AllowCortana"          DWord 0
+    Set-RegValue $ws "DisableWebSearch"      DWord 1
+    Set-RegValue $ws "ConnectedSearchUseWeb" DWord 0
+
+    # Per-user (dispatcher): disable "suggested content", tips, and the
+    # "Let's finish setting up your device" (SCOOBE) prompt + advertising ID
+    if ($DispSid) {
+        Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+            param($root)
+            $cdm = "$root\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+            $off = @(
+                "ContentDeliveryAllowed","OemPreInstalledAppsEnabled","PreInstalledAppsEnabled",
+                "PreInstalledAppsEverEnabled","SilentInstalledAppsEnabled","SoftLandingEnabled",
+                "SystemPaneSuggestionsEnabled","RotatingLockScreenEnabled","RotatingLockScreenOverlayEnabled",
+                "SubscribedContent-310093Enabled","SubscribedContent-338387Enabled","SubscribedContent-338388Enabled",
+                "SubscribedContent-338389Enabled","SubscribedContent-338393Enabled","SubscribedContent-353694Enabled",
+                "SubscribedContent-353696Enabled","SubscribedContent-353698Enabled"
+            )
+            foreach ($v in $off) { Set-RegValue $cdm $v DWord 0 }
+            Set-RegValue "$root\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" DWord 0
+            Set-RegValue "$root\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" DWord 0
+        }
+    }
+}
+
+Invoke-Step "Block Microsoft Edge for $DispatcherUser" {
+    if (-not $DispSid) { throw "dispatcher SID not found" }
+    Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+        param($root)
+        # Edge policy: no first-run wizard, no default-browser nag, no sign-in/sync/background/promos
+        $edge = "$root\Software\Policies\Microsoft\Edge"
+        Set-RegValue $edge "HideFirstRunExperience"                        DWord 1
+        Set-RegValue $edge "DefaultBrowserSettingEnabled"                  DWord 0
+        Set-RegValue $edge "BackgroundModeEnabled"                         DWord 0
+        Set-RegValue $edge "StartupBoostEnabled"                           DWord 0
+        Set-RegValue $edge "BrowserSignin"                                 DWord 0
+        Set-RegValue $edge "SyncDisabled"                                  DWord 1
+        Set-RegValue $edge "PromotionalTabsEnabled"                        DWord 0
+        Set-RegValue $edge "ShowRecommendationsEnabled"                    DWord 0
+        Set-RegValue $edge "SpotlightExperiencesAndRecommendationsEnabled" DWord 0
+        Set-RegValue $edge "EdgeShoppingAssistantEnabled"                  DWord 0
+        Set-RegValue $edge "PersonalizationReportingEnabled"               DWord 0
+
+        # Stop the dispatcher from launching Edge at all, so they stay on the
+        # Chrome allowlist. Blocks msedge.exe only -- NOT msedgewebview2.exe,
+        # so apps that embed WebView2 keep working.
+        $exp = "$root\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+        Set-RegValue $exp "DisallowRun" DWord 1
+        $dr = "$exp\DisallowRun"
+        if (-not (Test-Path $dr)) { New-Item -Path $dr -Force | Out-Null }
+        Set-RegValue $dr "1" String "msedge.exe"
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Power + default browser
+# -----------------------------------------------------------------------------
+Write-Banner "8. Power plan & default browser"
+
+Invoke-Step "Power: max performance, screen never off, no sleep" {
+    # Prefer Ultimate Performance (this box is Win11 Pro for Workstations), else High Performance
+    $ult  = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+    $high = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+    powercfg -duplicatescheme $ult 2>$null | Out-Null
+    $active = $high
+    if ((powercfg /list 2>$null) -match $ult) { $active = $ult }
+    powercfg -setactive $active 2>$null
+
+    # Never turn off display / sleep / disk / hibernate (AC + DC)
+    foreach ($t in @("monitor-timeout-ac","monitor-timeout-dc","standby-timeout-ac","standby-timeout-dc",
+                      "disk-timeout-ac","disk-timeout-dc","hibernate-timeout-ac","hibernate-timeout-dc")) {
+        powercfg -change $t 0 2>$null
+    }
+
+    # Kill the lock-screen display-off timeout as well
+    powercfg /setacvalueindex SCHEME_CURRENT 7516b95f-f776-4464-8c53-06167f40cc99 8EC4B3A5-6868-48c2-BE75-4F3044BE88A7 0 2>$null
+    powercfg /setdcvalueindex SCHEME_CURRENT 7516b95f-f776-4464-8c53-06167f40cc99 8EC4B3A5-6868-48c2-BE75-4F3044BE88A7 0 2>$null
+
+    # Keep USB devices (headset/phone) alive -- disable USB selective suspend
+    powercfg /setacvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0 2>$null
+    powercfg /setdcvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0 2>$null
+
+    powercfg -hibernate off 2>$null
+    powercfg -setactive SCHEME_CURRENT 2>$null
+}
+
+Invoke-Step "Set Chrome as default browser" {
+    $chrome = @(
+        "C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $chrome) { Skip-Step "Chrome not installed" }
+
+    # Windows only honors default-browser changes via machine default associations
+    $xml = Join-Path $LogDir "kjems-default-apps.xml"
+    Set-Content -Path $xml -Encoding UTF8 -Force -Value @(
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<DefaultAssociations>',
+        '  <Association Identifier="http"  ProgId="ChromeHTML" ApplicationName="Google Chrome" />',
+        '  <Association Identifier="https" ProgId="ChromeHTML" ApplicationName="Google Chrome" />',
+        '  <Association Identifier=".htm"  ProgId="ChromeHTML" ApplicationName="Google Chrome" />',
+        '  <Association Identifier=".html" ProgId="ChromeHTML" ApplicationName="Google Chrome" />',
+        '</DefaultAssociations>'
+    )
+    & dism.exe /Online /Import-DefaultAppAssociations:"$xml" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "DISM import failed (exit $LASTEXITCODE)" }
+    "applies at the dispatcher's next fresh login"
+}
+
 # -----------------------------------------------------------------------------
 # 10. Disable Google / Edge / OneDrive updaters
 # -----------------------------------------------------------------------------
@@ -587,19 +736,85 @@ Invoke-Step "Add Volume Control shortcut to dispatcher desktop" {
     $sc.Save()
 }
 
-Invoke-Step "Copy startup programs (Bria, Chrome) for dispatcher" {
-    if (-not (Test-Path $DispStartup)) { New-Item -Path $DispStartup -ItemType Directory -Force | Out-Null }
-    $sources = @(
-        "C:\Users\Public\Desktop\Bria Enterprise.lnk",
-        "C:\Users\Public\Desktop\Google Chrome.lnk"
-    )
-    $copied = 0; $missing = @()
-    foreach ($s in $sources) {
-        if (Test-Path $s) { Copy-Item $s $DispStartup -Force; $copied++ }
-        else { $missing += (Split-Path $s -Leaf) }
+Invoke-Step "Set dispatcher startup apps (Chrome, Lexip)" {
+    if (-not $DispSid) { throw "dispatcher SID not found" }
+
+    # Chrome exe
+    $chrome = @(
+        "C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    # Lexip exe -- resolve from its uninstall entry (DisplayIcon or InstallLocation)
+    $lexip = $null
+    $info = Get-UninstallInfo "Lexip Control Software"
+    if ($info) {
+        if ($info.DisplayIcon) {
+            $cand = ($info.DisplayIcon -replace ',\s*\d+\s*$','').Trim('"')
+            if ($cand -and (Test-Path $cand)) { $lexip = $cand }
+        }
+        if (-not $lexip -and $info.InstallLocation -and (Test-Path $info.InstallLocation)) {
+            $lexip = Get-ChildItem $info.InstallLocation -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -match 'Lexip' } | Select-Object -First 1 -ExpandProperty FullName
+        }
     }
-    if ($copied -eq 0) { Skip-Step ("no shortcuts found: " + ($missing -join ", ")) }
-    if ($missing.Count) { "copied $copied, missing: $($missing -join ', ')" }
+
+    $script:_StartChrome = $chrome
+    $script:_StartLexip  = $lexip
+
+    # Register both under the dispatcher's per-user Run key (starts them at that
+    # user's login; Chrome opens the kiosk URL via the RestoreOnStartup policy)
+    Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+        param($root)
+        $run = "$root\Software\Microsoft\Windows\CurrentVersion\Run"
+        if (-not (Test-Path $run)) { New-Item -Path $run -Force | Out-Null }
+        if ($script:_StartChrome) { Set-RegValue $run "GoogleChrome" String ('"{0}"' -f $script:_StartChrome) }
+        if ($script:_StartLexip)  { Set-RegValue $run "LexipControl" String ('"{0}"' -f $script:_StartLexip) }
+    }
+
+    if (-not $chrome) { throw "Chrome not installed -- cannot start it at login" }
+    if (-not $lexip)  { "Chrome start set; Lexip exe not found (install Lexip first)" }
+}
+
+Invoke-Step "Pin Chrome + Bria to the taskbar (dispatcher)" {
+    $chrome = @(
+        "C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $bria = @(
+        "C:\Program Files (x86)\CounterPath\Bria Enterprise\BriaEnterprise.exe",
+        "C:\Program Files\CounterPath\Bria Enterprise\BriaEnterprise.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    $links = @()
+    if ($chrome) { $links += (Ensure-Shortcut -Exe $chrome -Name "Google Chrome") }
+    if ($bria)   { $links += (Ensure-Shortcut -Exe $bria   -Name "Bria Enterprise") }
+    if ($links.Count -eq 0) { Skip-Step "neither Chrome nor Bria installed yet" }
+
+    # LayoutModification.xml applied to the dispatcher profile before first logon.
+    # PinListPlacement="Replace" also clears the default Edge/Store taskbar pins.
+    $pins = ($links | ForEach-Object {
+        '        <taskbar:DesktopApp DesktopApplicationLinkPath="{0}" />' -f $_
+    }) -join "`r`n"
+
+    $xml = @(
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">',
+        '  <CustomTaskbarLayoutCollection PinListPlacement="Replace">',
+        '    <defaultlayout:TaskbarLayout>',
+        '      <taskbar:TaskbarPinList>',
+        $pins,
+        '      </taskbar:TaskbarPinList>',
+        '    </defaultlayout:TaskbarLayout>',
+        '  </CustomTaskbarLayoutCollection>',
+        '</LayoutModificationTemplate>'
+    )
+
+    $shellDir = Join-Path $DispProfile "AppData\Local\Microsoft\Windows\Shell"
+    if (-not (Test-Path $shellDir)) { New-Item -Path $shellDir -ItemType Directory -Force | Out-Null }
+    Set-Content -Path (Join-Path $shellDir "LayoutModification.xml") -Value $xml -Encoding UTF8 -Force
+
+    "pinned: " + (($links | ForEach-Object { Split-Path $_ -Leaf }) -join ", ")
 }
 
 # -----------------------------------------------------------------------------
