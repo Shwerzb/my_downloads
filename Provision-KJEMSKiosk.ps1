@@ -192,6 +192,11 @@ $WallpaperSrc  = Join-Path $ScriptDir "wallpaper-noclock.png"  # desktop + lock 
 $WallpaperUrl  = "https://raw.githubusercontent.com/Shwerzb/my_downloads/main/wallpaper-noclock.png"  # auto-downloaded if missing
 $LogDir        = "C:\ProgramData\KJEMS"
 
+# Remove leftover LOCAL Group Policy (old ADMX / ManageEngine config) that would
+# otherwise override this script's registry policies at every logon. Backups are
+# saved next to the originals as Registry.pol.kjems-bak.
+$RemoveLocalGroupPolicy = $true
+
 # =============================================================================
 #  END CONFIG  --  no need to edit below
 # =============================================================================
@@ -383,6 +388,28 @@ Invoke-Step "Relax local password policy" {
     secedit /configure /db $sdb /cfg $cfg /areas SECURITYPOLICY /overwrite /quiet | Out-Null
     Remove-Item $cfg,$sdb -ErrorAction SilentlyContinue
     & "$env:SystemRoot\System32\net.exe" accounts /minpwlen:0 /maxpwage:unlimited /minpwage:0 | Out-Null
+}
+
+Invoke-Step "Remove leftover Local Group Policy (old ADMX / ManageEngine)" {
+    if (-not $RemoveLocalGroupPolicy) { Skip-Step "disabled in config" }
+    $removed = @()
+    foreach ($f in @(
+        "$env:SystemRoot\System32\GroupPolicy\User\Registry.pol",
+        "$env:SystemRoot\System32\GroupPolicy\Machine\Registry.pol")) {
+        if (Test-Path $f) {
+            Copy-Item $f "$f.kjems-bak" -Force -ErrorAction SilentlyContinue   # backup first
+            Remove-Item $f -Force -ErrorAction Stop
+            $removed += ((Split-Path (Split-Path $f -Parent) -Leaf) + "\Registry.pol")
+        }
+    }
+    # Per-user local GPOs (rare), if present
+    Get-ChildItem "$env:SystemRoot\System32\GroupPolicyUsers" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $rp = Join-Path $_.FullName "User\Registry.pol"
+        if (Test-Path $rp) { Remove-Item $rp -Force -ErrorAction SilentlyContinue; $removed += "$($_.Name)\User\Registry.pol" }
+    }
+    if ($removed.Count -eq 0) { Skip-Step "no leftover Local GPO found" }
+    & gpupdate.exe /force 2>&1 | Out-Null
+    "removed + gpupdate: " + ($removed -join ", ")
 }
 
 # -----------------------------------------------------------------------------
