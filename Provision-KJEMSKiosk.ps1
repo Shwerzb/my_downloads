@@ -118,6 +118,18 @@ $ChromeAllowedSites = @(
 
 $ChromeWebStoreUpdateUrl = "https://clients2.google.com/service/update2/crx"
 
+# ---- Dispatcher app allowlist ------------------------------------------------
+# The dispatcher can ONLY launch these executables (matched by file name).
+# Everything else (cmd, Task Manager, Store, Edge, regedit, ...) is blocked.
+# Chrome / Bria / Lexip / Jabra are auto-added from their installed paths -- list
+# here only extra apps you want to permit, plus the shell essentials below.
+$DispatcherAllowedExes = @(
+    "explorer.exe",        # Windows shell -- keep this or the desktop can break
+    "chrome.exe",          # Google Chrome (fallback name)
+    "BriaEnterprise.exe",  # Bria softphone (fallback name)
+    "SndVol.exe"           # Volume control shortcut
+)
+
 # ---- Software to install ----------------------------------------------------
 # Each entry:
 #   Name    = friendly label shown in the summary
@@ -646,15 +658,7 @@ Invoke-Step "Block Microsoft Edge for $DispatcherUser" {
         Set-RegValue $edge "SpotlightExperiencesAndRecommendationsEnabled" DWord 0
         Set-RegValue $edge "EdgeShoppingAssistantEnabled"                  DWord 0
         Set-RegValue $edge "PersonalizationReportingEnabled"               DWord 0
-
-        # Stop the dispatcher from launching Edge at all, so they stay on the
-        # Chrome allowlist. Blocks msedge.exe only -- NOT msedgewebview2.exe,
-        # so apps that embed WebView2 keep working.
-        $exp = "$root\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
-        Set-RegValue $exp "DisallowRun" DWord 1
-        $dr = "$exp\DisallowRun"
-        if (-not (Test-Path $dr)) { New-Item -Path $dr -Force | Out-Null }
-        Set-RegValue $dr "1" String "msedge.exe"
+        # (Edge is also fully prevented from launching by the app allowlist step.)
     }
 }
 
@@ -917,6 +921,58 @@ Invoke-Step "Pin Chrome + Bria to the taskbar (dispatcher)" {
     Set-Content -Path (Join-Path $shellDir "LayoutModification.xml") -Value $xml -Encoding UTF8 -Force
 
     "pinned: " + (($links | ForEach-Object { Split-Path $_ -Leaf }) -join ", ")
+}
+
+Invoke-Step "Restrict dispatcher to allowed apps only (RestrictRun)" {
+    if (-not $DispSid) { throw "dispatcher SID not found" }
+
+    $allowed = [System.Collections.Generic.List[string]]::new()
+    foreach ($e in $DispatcherAllowedExes) { if ($e) { $allowed.Add($e) } }
+
+    # Add the real exe names of installed allowed apps so auto-start + pins work
+    $chrome = @(
+        "C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($chrome) { $allowed.Add((Split-Path $chrome -Leaf)) }
+
+    $bria = @(
+        "C:\Program Files (x86)\CounterPath\Bria Enterprise\BriaEnterprise.exe",
+        "C:\Program Files\CounterPath\Bria Enterprise\BriaEnterprise.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($bria) { $allowed.Add((Split-Path $bria -Leaf)) }
+
+    $info = Get-UninstallInfo "Lexip Control Software"
+    if ($info -and $info.DisplayIcon) {
+        $lx = ($info.DisplayIcon -replace ',\s*\d+\s*$','').Trim('"')
+        if ($lx -and (Test-Path $lx)) { $allowed.Add((Split-Path $lx -Leaf)) }
+    }
+
+    $jabra = Get-ChildItem "C:\Program Files\Jabra","C:\Program Files (x86)\Jabra" `
+                -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+             Where-Object { $_.BaseName -match 'Jabra.?Direct' } |
+             Select-Object -First 1 -ExpandProperty FullName
+    if ($jabra) { $allowed.Add((Split-Path $jabra -Leaf)) }
+
+    $script:_AllowedExes = $allowed | Sort-Object -Unique
+
+    Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+        param($root)
+        $exp = "$root\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+        # Allowlist mode: only the listed apps may be launched by the dispatcher
+        Set-RegValue $exp "RestrictRun" DWord 1
+        # RestrictRun supersedes DisallowRun -- clear any Edge blocklist to avoid conflict
+        Remove-ItemProperty -Path $exp -Name "DisallowRun" -ErrorAction SilentlyContinue
+        Remove-Item -Path "$exp\DisallowRun" -Recurse -Force -ErrorAction SilentlyContinue
+
+        $rr = "$exp\RestrictRun"
+        Remove-Item -Path $rr -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -Path $rr -Force | Out-Null
+        $i = 1
+        foreach ($exe in $script:_AllowedExes) { Set-RegValue $rr "$i" String $exe; $i++ }
+    }
+
+    "allowed: " + ($script:_AllowedExes -join ", ")
 }
 
 # -----------------------------------------------------------------------------
