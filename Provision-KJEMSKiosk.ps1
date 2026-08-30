@@ -417,6 +417,38 @@ Invoke-Step "Remove leftover Local Group Policy (old ADMX / ManageEngine)" {
 # -----------------------------------------------------------------------------
 Write-Banner "2. Local accounts"
 
+Invoke-Step "Deep-clean dispatcher profile (-ResetDispatcher)" {
+    if (-not $ResetDispatcher) { Skip-Step "not requested" }
+
+    # Never run while the dispatcher is signed in
+    $live = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+        Where-Object { $_.Loaded -and $_.LocalPath -like "C:\Users\$DispatcherUser*" }
+    if ($live) { throw "dispatcher is signed in -- sign it out, then re-run" }
+
+    # Delete the account so it is recreated with a single, clean profile
+    if (Get-LocalUser -Name $DispatcherUser -ErrorAction SilentlyContinue) {
+        Remove-LocalUser -Name $DispatcherUser -ErrorAction SilentlyContinue
+    }
+
+    # Remove EVERY profile for this user (including orphaned/temp ones left by
+    # past resets), plus its ProfileList entry and folder.
+    Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalPath -like "C:\Users\$DispatcherUser*" } |
+        ForEach-Object { Remove-CimInstance -InputObject $_ -ErrorAction SilentlyContinue }
+
+    $pl = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+    Get-ChildItem $pl | ForEach-Object {
+        $img = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+        if ($img -like "C:\Users\$DispatcherUser*") { Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "$DispatcherUser*" } |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+
+    "purged the account + all '$DispatcherUser' profiles/folders/ProfileList entries -- a clean profile is created next"
+}
+
 Invoke-Step "Create admin account '$AdminUser'" {
     if (Get-LocalUser -Name $AdminUser -ErrorAction SilentlyContinue) { Skip-Step "already exists" }
     New-LocalUser -Name $AdminUser -Password $AdminSecurePassword -FullName $AdminFullName `
@@ -466,25 +498,6 @@ Invoke-Step "Apply passwords + never-expires" {
 # 5. Materialize dispatcher profile on disk (no interactive logon needed)
 # -----------------------------------------------------------------------------
 Write-Banner "3. Dispatcher profile"
-
-Invoke-Step "Reset dispatcher profile (-ResetDispatcher)" {
-    if (-not $ResetDispatcher) { Skip-Step "not requested" }
-    $sid = $null
-    try { $sid = Get-UserSid $DispatcherUser } catch {}
-    if (-not $sid) { Skip-Step "dispatcher account not found" }
-
-    $prof = Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue
-    if ($prof -and $prof.Loaded) { throw "dispatcher is signed in -- sign it out, then re-run" }
-
-    if ($prof) {
-        Remove-CimInstance -InputObject $prof -ErrorAction Stop
-        "deleted profile for $DispatcherUser -- it will be recreated fresh"
-    } else {
-        $p = Join-Path "C:\Users" $DispatcherUser
-        if (Test-Path $p) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
-        "no registered profile; cleaned any leftover folder"
-    }
-}
 
 Invoke-Step "Create dispatcher profile on disk" {
     $sid = Get-UserSid $DispatcherUser
@@ -555,16 +568,15 @@ foreach ($app in $Software) {
 # -----------------------------------------------------------------------------
 # 7. Chrome kiosk policy  (DISPATCHER ONLY)
 # -----------------------------------------------------------------------------
-Write-Banner "5. Chrome kiosk lockdown (machine-wide)"
-Invoke-Step "Apply Chrome kiosk policy (machine-wide)" {
+Write-Banner "5. Chrome kiosk lockdown (dispatcher only)"
+Invoke-Step "Apply Chrome policy to $DispatcherUser" {
+    if (-not $DispSid) { throw "dispatcher SID not found" }
     Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-    # Machine-wide (HKLM) so Chrome ALWAYS enforces it -- in any session, and even
-    # if the dispatcher lands on a temporary profile. Berish's Chrome is governed
-    # by this too; Berish browses unrestricted via Edge (Edge is blocked only for
-    # the dispatcher).
-    $base = "HKLM:\SOFTWARE\Policies\Google\Chrome"
-    New-Item -Path $base -Force | Out-Null
+    Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+        param($root)
+        $base = "$root\Software\Policies\Google\Chrome"
+        New-Item -Path $base -Force | Out-Null
 
         # Allowlist
         $allow = "$base\URLAllowlist"
@@ -619,6 +631,7 @@ Invoke-Step "Apply Chrome kiosk policy (machine-wide)" {
             $j = 1
             foreach ($u in $ChromeSitePermissionUrls) { Set-RegValue $kp "$j" String $u; $j++ }
         }
+    }
 }
 
 # -----------------------------------------------------------------------------
