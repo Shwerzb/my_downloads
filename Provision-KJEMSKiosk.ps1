@@ -521,6 +521,24 @@ $DispChromeDef  = Join-Path $DispProfile "AppData\Local\Google\Chrome\User Data\
 $DispStartup    = Join-Path $DispProfile "AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
 $WallpaperDest  = Join-Path $LogDir "kjems-wallpaper.png"
 
+Invoke-Step "Scrub leftover kiosk lockdown policies (ManageEngine/GPO)" {
+    if (-not $DispSid) { Skip-Step "no dispatcher profile yet" }
+    Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+        param($root)
+        # Old ManageEngine/GPO lockdown accumulates in these two keys
+        # (NoPinningToTaskbar, DisableControlCenter, NoRun, NoDesktop, LockTaskbar,
+        # HideTaskViewButton, ...) and breaks the taskbar + volume flyout. Wipe
+        # both keys entirely; our later steps re-add ONLY the values we want
+        # (SettingsPageVisibility, DisallowRun, StartLayoutFile).
+        foreach ($k in @(
+            "$root\Software\Policies\Microsoft\Windows\Explorer",
+            "$root\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer")) {
+            Remove-Item -Path $k -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    "wiped leftover Explorer lockdown policies (taskbar pinning / volume / Start)"
+}
+
 # -----------------------------------------------------------------------------
 # 6. Install software
 # -----------------------------------------------------------------------------
