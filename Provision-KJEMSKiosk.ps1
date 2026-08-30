@@ -886,6 +886,14 @@ Invoke-Step "Remove Microsoft bloatware apps" {
 # 10. Disable Google / Edge / OneDrive updaters
 # -----------------------------------------------------------------------------
 Invoke-Step "Disable Google/Edge/OneDrive updaters" {
+    # Fully disable Microsoft OneDrive (no sync, don't run) + keep it off startup
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" DWord 1
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSync"     DWord 1
+    Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "OneDriveSetup" -ErrorAction SilentlyContinue
+    Get-Process OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Keep apps allowed to run in the background (don't let Windows suspend them)
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" "LetAppsRunInBackground" DWord 1
+
     $gu = "HKLM:\SOFTWARE\Policies\Google\Update"
     Set-RegValue $gu "UpdateDefault" DWord 0
     Set-RegValue $gu "Update{8A69D345-D564-463C-AFF1-A69D9E530F96}" DWord 0
@@ -982,6 +990,7 @@ Invoke-Step "Set dispatcher startup apps (Chrome, Lexip)" {
 }
 
 Invoke-Step "Pin Chrome + Bria to the taskbar (dispatcher)" {
+    if (-not $DispSid) { throw "dispatcher SID not found" }
     $chrome = @(
         "C:\Program Files\Google\Chrome\Application\chrome.exe",
         "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
@@ -1015,27 +1024,35 @@ Invoke-Step "Pin Chrome + Bria to the taskbar (dispatcher)" {
         '</LayoutModificationTemplate>'
     )
 
-    # Write the layout to the dispatcher profile AND the Default profile, so a
-    # freshly created dispatcher profile also picks it up at first sign-in.
+    # Current supported method (Win11 24H2/25H2): the profile "Shell folder" file
+    # is IGNORED since 24H2 -- the "Start Layout" policy must point to the XML.
+    # Write the XML to a stable machine path:
+    $layoutPath = Join-Path $LogDir "taskbar-layout.xml"
+    Set-Content -Path $layoutPath -Value $xml -Encoding UTF8 -Force
+
+    # Legacy fallback for older builds: also drop it in the profile Shell folders.
     foreach ($base in @($DispProfile, "C:\Users\Default")) {
         $shellDir = Join-Path $base "AppData\Local\Microsoft\Windows\Shell"
         if (-not (Test-Path $shellDir)) { New-Item -Path $shellDir -ItemType Directory -Force | Out-Null }
         Set-Content -Path (Join-Path $shellDir "LayoutModification.xml") -Value $xml -Encoding UTF8 -Force
     }
 
-    # If the dispatcher already signed in once, its taskbar is already built and
-    # ignores the file -- clear the cached taskbar pins so it rebuilds from our
-    # layout on next logon.
-    if ($DispSid) {
-        Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
-            param($root)
-            $tb = "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
-            Remove-ItemProperty -Path $tb -Name "Favorites"        -ErrorAction SilentlyContinue
-            Remove-ItemProperty -Path $tb -Name "FavoritesResolve" -ErrorAction SilentlyContinue
-        }
+    $script:_LayoutPath = $layoutPath
+    Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+        param($root)
+        # Per-user "Start Layout" policy -> our XML. Dispatcher-only; the taskbar
+        # part applies at next sign-in (Win11 Start pins stay governed by
+        # ConfigureStartPins). LockedStartLayout=1 = policy "enabled" state.
+        $exp = "$root\Software\Policies\Microsoft\Windows\Explorer"
+        Set-RegValue $exp "StartLayoutFile"   String $script:_LayoutPath
+        Set-RegValue $exp "LockedStartLayout" DWord  1
+        # Force the taskbar to rebuild from the layout
+        $tb = "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
+        Remove-ItemProperty -Path $tb -Name "Favorites"        -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $tb -Name "FavoritesResolve" -ErrorAction SilentlyContinue
     }
 
-    "pinned: " + (($links | ForEach-Object { Split-Path $_ -Leaf }) -join ", ")
+    "pinned via Start Layout policy: " + (($links | ForEach-Object { Split-Path $_ -Leaf }) -join ", ")
 }
 
 Invoke-Step "Block config/escape apps for the dispatcher (DisallowRun)" {
