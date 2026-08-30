@@ -551,12 +551,22 @@ Invoke-Step "Import Chrome bookmarks" {
 # -----------------------------------------------------------------------------
 Write-Banner "6. Desktop hardening"
 Invoke-Step "Disable Windows 11 widgets" {
-    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "DisableWidgetsOnLockScreen" DWord 1
+    # Machine-wide policy disables the widgets board + lock-screen widgets for
+    # everyone -- this is what actually turns widgets off.
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests"      DWord 0
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "DisableWidgetsOnLockScreen" DWord 1
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "DisableWidgetsBoard"        DWord 1
+
+    # Per-user taskbar button is cosmetic on top of the above -- best-effort so a
+    # transient hive hiccup can't fail the whole step.
     if ($DispSid) {
-        Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
-            param($root)
-            Set-RegValue "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" DWord 0
+        try {
+            Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+                param($root)
+                Set-RegValue "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" DWord 0
+            }
+        } catch {
+            "widgets disabled machine-wide; taskbar-button tweak skipped ($($_.Exception.Message))"
         }
     }
 }
@@ -943,9 +953,9 @@ Invoke-Step "Clean Lexip default profiles for dispatcher" {
 # =============================================================================
 #  SUMMARY
 # =============================================================================
-$ok   = ($script:Results | Where-Object Status -eq "OK").Count
-$skip = ($script:Results | Where-Object Status -eq "SKIP").Count
-$fail = ($script:Results | Where-Object Status -eq "FAIL").Count
+$ok   = @($script:Results | Where-Object { $_.Status -eq "OK"   }).Count
+$skip = @($script:Results | Where-Object { $_.Status -eq "SKIP" }).Count
+$fail = @($script:Results | Where-Object { $_.Status -eq "FAIL" }).Count
 
 Write-Banner "SUMMARY   |   OK: $ok   SKIP: $skip   FAIL: $fail"
 foreach ($r in $script:Results) {
@@ -963,7 +973,7 @@ if ($fail -gt 0) {
     Write-Host "  $fail step(s) FAILED. See details above and the log:" -ForegroundColor Red
     Write-Host "  $LogFile" -ForegroundColor Red
 } else {
-    Write-Host "  All steps completed (failures: 0). Reboot recommended." -ForegroundColor Green
+    Write-Host "  All steps completed with no failures. Reboot recommended." -ForegroundColor Green
 }
 Write-Host ""
 
