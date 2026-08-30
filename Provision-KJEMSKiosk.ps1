@@ -63,7 +63,7 @@ if (-not $__isAdmin) {
 
 # ---- Accounts ---------------------------------------------------------------
 $DispatcherUser     = "kioskUser0"
-$DispatcherPassword = "1212783"          # <-- dispatcher password
+$DispatcherPassword = ""                  # blank = dispatcher logs in with NO password
 $DispatcherFullName = "EMS Dispatcher"
 
 $AdminUser          = "Berish"           # local admin account name
@@ -364,10 +364,16 @@ Invoke-Step "Create admin account '$AdminUser'" {
 
 Invoke-Step "Create dispatcher account '$DispatcherUser'" {
     if (Get-LocalUser -Name $DispatcherUser -ErrorAction SilentlyContinue) { Skip-Step "already exists" }
-    $sec = ConvertTo-SecureString $DispatcherPassword -AsPlainText -Force
-    New-LocalUser -Name $DispatcherUser -Password $sec -FullName $DispatcherFullName `
-        -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop | Out-Null
+    if ([string]::IsNullOrEmpty($DispatcherPassword)) {
+        New-LocalUser -Name $DispatcherUser -NoPassword -FullName $DispatcherFullName `
+            -AccountNeverExpires -ErrorAction Stop | Out-Null
+    } else {
+        $sec = ConvertTo-SecureString $DispatcherPassword -AsPlainText -Force
+        New-LocalUser -Name $DispatcherUser -Password $sec -FullName $DispatcherFullName `
+            -AccountNeverExpires -PasswordNeverExpires -ErrorAction Stop | Out-Null
+    }
     Add-LocalGroupMember -Group "Users" -Member $DispatcherUser -ErrorAction SilentlyContinue
+    Set-LocalUser -Name $DispatcherUser -PasswordNeverExpires $true -ErrorAction SilentlyContinue
 }
 
 # -----------------------------------------------------------------------------
@@ -378,8 +384,12 @@ Invoke-Step "Apply passwords + never-expires" {
         Set-LocalUser -Name $AdminUser -Password $AdminSecurePassword -PasswordNeverExpires $true -ErrorAction Stop
     }
     if (Get-LocalUser -Name $DispatcherUser -ErrorAction SilentlyContinue) {
-        $sec = ConvertTo-SecureString $DispatcherPassword -AsPlainText -Force
-        Set-LocalUser -Name $DispatcherUser -Password $sec -PasswordNeverExpires $true -ErrorAction Stop
+        if ([string]::IsNullOrEmpty($DispatcherPassword)) {
+            Set-LocalUser -Name $DispatcherUser -Password (New-Object System.Security.SecureString) -PasswordNeverExpires $true -ErrorAction Stop
+        } else {
+            $sec = ConvertTo-SecureString $DispatcherPassword -AsPlainText -Force
+            Set-LocalUser -Name $DispatcherUser -Password $sec -PasswordNeverExpires $true -ErrorAction Stop
+        }
     }
 }
 
@@ -681,6 +691,78 @@ Invoke-Step "Set Chrome as default browser" {
     & dism.exe /Online /Import-DefaultAppAssociations:"$xml" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DISM import failed (exit $LASTEXITCODE)" }
     "applies at the dispatcher's next fresh login"
+}
+
+# -----------------------------------------------------------------------------
+# Start menu cleanup
+# -----------------------------------------------------------------------------
+Write-Banner "9. Start menu cleanup"
+
+Invoke-Step "Pin only allowed apps + hide Recommended" {
+    $chrome = @(
+        "C:\Program Files\Google\Chrome\Application\chrome.exe",
+        "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $bria = @(
+        "C:\Program Files (x86)\CounterPath\Bria Enterprise\BriaEnterprise.exe",
+        "C:\Program Files\CounterPath\Bria Enterprise\BriaEnterprise.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    # Build the pinned-apps JSON (backslashes are pre-escaped for JSON)
+    $items = @()
+    if ($chrome) {
+        Ensure-Shortcut -Exe $chrome -Name "Google Chrome" | Out-Null
+        $items += '{"desktopAppLink":"%ALLUSERSPROFILE%\\Microsoft\\Windows\\Start Menu\\Programs\\Google Chrome.lnk"}'
+    }
+    if ($bria) {
+        Ensure-Shortcut -Exe $bria -Name "Bria Enterprise" | Out-Null
+        $items += '{"desktopAppLink":"%ALLUSERSPROFILE%\\Microsoft\\Windows\\Start Menu\\Programs\\Bria Enterprise.lnk"}'
+    }
+
+    if ($items.Count) {
+        $json = '{"pinnedList":[' + ($items -join ',') + ']}'
+        $sp = "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Start"
+        Set-RegValue $sp "ConfigureStartPins"             String $json
+        Set-RegValue $sp "ConfigureStartPins_ProviderSet" DWord  1
+    }
+
+    # Hide the Recommended section (machine)
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" "HideRecommendedSection" DWord 1
+
+    # Per-user: stop tracking recent docs/apps + turn off "iris" recommendations
+    if ($DispSid) {
+        Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+            param($root)
+            $adv = "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+            Set-RegValue $adv "Start_TrackDocs"           DWord 0
+            Set-RegValue $adv "Start_TrackProgs"          DWord 0
+            Set-RegValue $adv "Start_IrisRecommendations" DWord 0
+        }
+    }
+
+    if (-not $items.Count) { "Chrome/Bria not installed yet -- pins not set" }
+}
+
+Invoke-Step "Remove Microsoft bloatware apps" {
+    $patterns = @(
+        "Microsoft.BingNews","Microsoft.BingWeather","Microsoft.BingSearch",
+        "Microsoft.GamingApp","Microsoft.Xbox*","Microsoft.ZuneMusic","Microsoft.ZuneVideo",
+        "Microsoft.MicrosoftSolitaireCollection","Microsoft.People","Microsoft.windowscommunicationsapps",
+        "Microsoft.Todos","Microsoft.PowerAutomateDesktop","*Clipchamp*","*Teams*","MicrosoftTeams",
+        "Microsoft.WindowsFeedbackHub","Microsoft.GetHelp","Microsoft.Getstarted","Microsoft.MicrosoftOfficeHub",
+        "*WhatsApp*","*LinkedIn*","*Spotify*","*Disney*","*Facebook*","*Instagram*","*Prime*","*TikTok*",
+        "Microsoft.549981C3F5F10","Microsoft.MixedReality.Portal","Microsoft.OutlookForWindows"
+    )
+    $removed = 0
+    foreach ($p in $patterns) {
+        Get-AppxPackage -AllUsers -Name $p -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction Stop; $removed++ } catch {}
+        }
+        Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like $p } |
+            ForEach-Object { try { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction Stop | Out-Null } catch {} }
+    }
+    "removed $removed installed package(s) + matching provisioned packages"
 }
 
 # -----------------------------------------------------------------------------
