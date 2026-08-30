@@ -710,16 +710,16 @@ Invoke-Step "Set EMS desktop + lock screen wallpaper" {
     # Lock screen for ALL users (machine policy)
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization" "LockScreenImage" String $WallpaperDest
 
-    # Desktop wallpaper enforced for the dispatcher (10 = Fill)
+    # Desktop wallpaper enforced for the dispatcher (6 = Fit to screen)
     if ($DispSid) {
         Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
             param($root)
             $sys = "$root\Software\Microsoft\Windows\CurrentVersion\Policies\System"
             Set-RegValue $sys "Wallpaper"      String $WallpaperDest
-            Set-RegValue $sys "WallpaperStyle" String "10"
+            Set-RegValue $sys "WallpaperStyle" String "6"
             $cpd = "$root\Control Panel\Desktop"
             Set-RegValue $cpd "Wallpaper"      String $WallpaperDest
-            Set-RegValue $cpd "WallpaperStyle" String "10"
+            Set-RegValue $cpd "WallpaperStyle" String "6"
             Set-RegValue $cpd "TileWallpaper"  String "0"
         }
     }
@@ -986,17 +986,17 @@ Invoke-Step "Set dispatcher startup apps (Chrome, Lexip)" {
         "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
-    # Lexip exe -- resolve from its uninstall entry (DisplayIcon or InstallLocation)
+    # Lexip exe -- the MAIN control panel is lcp.exe (NOT updater.exe and NOT the
+    # firmware_update\LexipFwUpd.exe tool that just prints usage and waits).
     $lexip = $null
     $info = Get-UninstallInfo "Lexip Control Software"
-    if ($info) {
-        if ($info.DisplayIcon) {
-            $cand = ($info.DisplayIcon -replace ',\s*\d+\s*$','').Trim('"')
-            if ($cand -and (Test-Path $cand)) { $lexip = $cand }
-        }
-        if (-not $lexip -and $info.InstallLocation -and (Test-Path $info.InstallLocation)) {
-            $lexip = Get-ChildItem $info.InstallLocation -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
-                     Where-Object { $_.Name -match 'Lexip' } | Select-Object -First 1 -ExpandProperty FullName
+    if ($info -and $info.InstallLocation -and (Test-Path $info.InstallLocation)) {
+        $lexip = Get-ChildItem $info.InstallLocation -Filter "lcp.exe" -Recurse -ErrorAction SilentlyContinue |
+                 Select-Object -First 1 -ExpandProperty FullName
+        if (-not $lexip) {
+            $lexip = Get-ChildItem $info.InstallLocation -Filter *.exe -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -notmatch 'updater|FwUpd|firmware' } |
+                     Select-Object -First 1 -ExpandProperty FullName
         }
     }
 
