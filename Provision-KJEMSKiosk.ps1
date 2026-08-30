@@ -1106,19 +1106,19 @@ Invoke-Step "Pin Chrome + Bria to the taskbar (dispatcher)" {
     $script:_LayoutPath = $layoutPath
     Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
         param($root)
-        # Per-user "Start Layout" policy -> our XML. Dispatcher-only; the taskbar
-        # part applies at next sign-in (Win11 Start pins stay governed by
-        # ConfigureStartPins). LockedStartLayout=1 = policy "enabled" state.
+        # NOTE: StartLayoutFile + LockedStartLayout can blank/break the Win11 shell
+        # on 24H2/25H2 (and stop Run-key apps like Chrome from launching), so we do
+        # NOT set them. Make sure any from an earlier run are cleared.
         $exp = "$root\Software\Policies\Microsoft\Windows\Explorer"
-        Set-RegValue $exp "StartLayoutFile"   String $script:_LayoutPath
-        Set-RegValue $exp "LockedStartLayout" DWord  1
+        Remove-ItemProperty -Path $exp -Name "StartLayoutFile"   -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $exp -Name "LockedStartLayout" -ErrorAction SilentlyContinue
         # Force the taskbar to rebuild from the layout
         $tb = "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
         Remove-ItemProperty -Path $tb -Name "Favorites"        -ErrorAction SilentlyContinue
         Remove-ItemProperty -Path $tb -Name "FavoritesResolve" -ErrorAction SilentlyContinue
     }
 
-    "pinned via Start Layout policy: " + (($links | ForEach-Object { Split-Path $_ -Leaf }) -join ", ")
+    "taskbar layout written (apps also auto-start): " + (($links | ForEach-Object { Split-Path $_ -Leaf }) -join ", ")
 }
 
 Invoke-Step "Block config/escape apps for the dispatcher (DisallowRun)" {
