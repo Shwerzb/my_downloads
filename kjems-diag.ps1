@@ -48,6 +48,21 @@ H "Chrome cloud management (HKLM)"
 H "Other management still on this PC"
 Write-Host ("ManageEngine folder: " + (Test-Path 'C:\Program Files (x86)\ManageEngine'))
 Write-Host ("Intune agent running: " + ((Get-Process 'Microsoft.Management.Services.IntuneWindowsAgent' -EA SilentlyContinue|Measure-Object).Count))
+Write-Host "ManageEngine services (RUNNING = it will re-apply lockdown):"
+Get-CimInstance Win32_Service | Where-Object { $_.PathName -match 'ManageEngine|UEMS|DesktopCentral' } | ForEach-Object { Write-Host ("  {0} [{1}] {2}" -f $_.Name,$_.State,$_.PathName) }
+Get-Process | Where-Object { $_.Path -match 'ManageEngine|UEMS' } | ForEach-Object { Write-Host ("  proc: {0}" -f $_.Path) }
+
+H "kioskUser0 profiles (want ONE clean entry, NO orphans, NO temp)"
+$pl2 = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+Get-ChildItem $pl2 | ForEach-Object {
+  $img=(Get-ItemProperty $_.PSPath -EA SilentlyContinue).ProfileImagePath
+  $st =(Get-ItemProperty $_.PSPath -EA SilentlyContinue).State
+  if ($img -like '*kioskUser0*' -or $img -like '*TEMP*' -or $_.PSChildName -like '*.bak') {
+    Write-Host ("  {0}  {1}  State={2}" -f $_.PSChildName,$img,$st) -ForegroundColor Yellow
+  }
+}
+H "C:\Users folders for the dispatcher"
+Get-ChildItem 'C:\Users' -Directory -EA SilentlyContinue | Where-Object { $_.Name -like 'kioskUser0*' -or $_.Name -like 'TEMP*' } | ForEach-Object { Write-Host ("  " + $_.Name) }
 
 Stop-Transcript | Out-Null
 Write-Host ""
