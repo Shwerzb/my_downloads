@@ -64,7 +64,7 @@ if (-not $__isAdmin) {
 # ---- Accounts ---------------------------------------------------------------
 $DispatcherUser     = "kioskUser0"
 $DispatcherPassword = ""                  # blank = dispatcher logs in with NO password
-$DispatcherFullName = "EMS Dispatcher"
+$DispatcherFullName = "Dispatcher"
 
 $AdminUser          = "Berish"           # local admin account name
 $AdminFullName      = "Berish"
@@ -118,16 +118,20 @@ $ChromeAllowedSites = @(
 
 $ChromeWebStoreUpdateUrl = "https://clients2.google.com/service/update2/crx"
 
-# ---- Dispatcher app allowlist ------------------------------------------------
-# The dispatcher can ONLY launch these executables (matched by file name).
-# Everything else (cmd, Task Manager, Store, Edge, regedit, ...) is blocked.
-# Chrome / Bria / Lexip / Jabra are auto-added from their installed paths -- list
-# here only extra apps you want to permit, plus the shell essentials below.
-$DispatcherAllowedExes = @(
-    "explorer.exe",        # Windows shell -- keep this or the desktop can break
-    "chrome.exe",          # Google Chrome (fallback name)
-    "BriaEnterprise.exe",  # Bria softphone (fallback name)
-    "SndVol.exe"           # Volume control shortcut
+# ---- Dispatcher blocked apps -------------------------------------------------
+# The dispatcher is BLOCKED from launching these executables (matched by file
+# name). A blocklist keeps the Windows shell fully working (taskbar, volume,
+# tray, startup apps) -- a strict allowlist breaks all of that. Add any other
+# apps you want to keep the dispatcher out of.
+$DispatcherBlockedExes = @(
+    "msedge.exe",                                          # Edge -- stay on Chrome
+    "iexplore.exe","firefox.exe","opera.exe","brave.exe","chromium.exe",  # other browsers
+    "cmd.exe","powershell.exe","powershell_ise.exe","pwsh.exe",           # shells
+    "regedit.exe","regedt32.exe",                          # registry
+    "taskmgr.exe",                                         # task manager
+    "mmc.exe","gpedit.exe","secpol.exe","lusrmgr.exe","compmgmt.exe",     # admin consoles
+    "msconfig.exe","control.exe","cscript.exe","wscript.exe",             # config/scripting
+    "WinStore.App.exe"                                     # Microsoft Store
 )
 
 # ---- Software to install ----------------------------------------------------
@@ -412,6 +416,8 @@ Invoke-Step "Apply passwords + never-expires" {
             $sec = ConvertTo-SecureString $DispatcherPassword -AsPlainText -Force
             Set-LocalUser -Name $DispatcherUser -Password $sec -PasswordNeverExpires $true -ErrorAction Stop
         }
+        # Update the display name too (create step is skipped for existing accounts)
+        Set-LocalUser -Name $DispatcherUser -FullName $DispatcherFullName -ErrorAction SilentlyContinue
     }
 }
 
@@ -750,8 +756,13 @@ Invoke-Step "Pin only allowed apps + hide Recommended" {
         Set-RegValue $sp "ConfigureStartPins_ProviderSet" DWord  1
     }
 
-    # Hide the Recommended section (machine)
+    # Hide the Recommended section ("Get Started", recent files). The GP value
+    # is ignored on Win11 Pro, so also set the CSP policy under PolicyManager --
+    # that's the path that actually took effect for the pins above.
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" "HideRecommendedSection" DWord 1
+    $spRec = "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Start"
+    Set-RegValue $spRec "HideRecommendedSection"             DWord 1
+    Set-RegValue $spRec "HideRecommendedSection_ProviderSet" DWord 1
 
     # Per-user: stop tracking recent docs/apps + turn off "iris" recommendations
     if ($DispSid) {
@@ -842,9 +853,11 @@ Invoke-Step "Add Volume Control shortcut to dispatcher desktop" {
     $sc.Save()
 }
 
-Invoke-Step "Set dispatcher startup apps (Chrome, Lexip, Jabra)" {
+Invoke-Step "Set dispatcher startup apps (Chrome, Lexip)" {
     if (-not $DispSid) { throw "dispatcher SID not found" }
-    # (Bria starts via its own logon scheduled task, registered further below.)
+    # Bria starts via its own logon scheduled task (below). Jabra Direct starts
+    # itself in the background/tray via its own installer autostart, so we do NOT
+    # launch its window here.
 
     # Chrome exe
     $chrome = @(
@@ -866,22 +879,8 @@ Invoke-Step "Set dispatcher startup apps (Chrome, Lexip, Jabra)" {
         }
     }
 
-    # Jabra Direct exe -- search the Jabra install folder, then fall back to uninstall info
-    $jabra = Get-ChildItem "C:\Program Files\Jabra","C:\Program Files (x86)\Jabra" `
-                -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-             Where-Object { $_.BaseName -match 'Jabra.?Direct' } |
-             Select-Object -First 1 -ExpandProperty FullName
-    if (-not $jabra) {
-        $ji = Get-UninstallInfo "Jabra Direct"
-        if ($ji -and $ji.DisplayIcon) {
-            $jc = ($ji.DisplayIcon -replace ',\s*\d+\s*$','').Trim('"')
-            if ($jc -and (Test-Path $jc)) { $jabra = $jc }
-        }
-    }
-
     $script:_StartChrome = $chrome
     $script:_StartLexip  = $lexip
-    $script:_StartJabra  = $jabra
 
     # Register under the dispatcher's per-user Run key (starts them at that user's
     # login; Chrome opens the kiosk URL via the RestoreOnStartup policy)
@@ -891,14 +890,13 @@ Invoke-Step "Set dispatcher startup apps (Chrome, Lexip, Jabra)" {
         if (-not (Test-Path $run)) { New-Item -Path $run -Force | Out-Null }
         if ($script:_StartChrome) { Set-RegValue $run "GoogleChrome" String ('"{0}"' -f $script:_StartChrome) }
         if ($script:_StartLexip)  { Set-RegValue $run "LexipControl" String ('"{0}"' -f $script:_StartLexip) }
-        if ($script:_StartJabra)  { Set-RegValue $run "JabraDirect"  String ('"{0}"' -f $script:_StartJabra) }
+        # Remove any foreground Jabra launcher a previous run added -- Jabra runs
+        # itself in the tray, and this entry was popping its window open.
+        Remove-ItemProperty -Path $run -Name "JabraDirect" -ErrorAction SilentlyContinue
     }
 
     if (-not $chrome) { throw "Chrome not installed -- cannot start it at login" }
-    $missing = @()
-    if (-not $lexip) { $missing += "Lexip" }
-    if (-not $jabra) { $missing += "Jabra" }
-    if ($missing.Count) { "Chrome start set; not found (install first): " + ($missing -join ", ") }
+    if (-not $lexip)  { "Chrome start set; Lexip exe not found (install Lexip first)" }
 }
 
 Invoke-Step "Pin Chrome + Bria to the taskbar (dispatcher)" {
@@ -935,63 +933,52 @@ Invoke-Step "Pin Chrome + Bria to the taskbar (dispatcher)" {
         '</LayoutModificationTemplate>'
     )
 
-    $shellDir = Join-Path $DispProfile "AppData\Local\Microsoft\Windows\Shell"
-    if (-not (Test-Path $shellDir)) { New-Item -Path $shellDir -ItemType Directory -Force | Out-Null }
-    Set-Content -Path (Join-Path $shellDir "LayoutModification.xml") -Value $xml -Encoding UTF8 -Force
+    # Write the layout to the dispatcher profile AND the Default profile, so a
+    # freshly created dispatcher profile also picks it up at first sign-in.
+    foreach ($base in @($DispProfile, "C:\Users\Default")) {
+        $shellDir = Join-Path $base "AppData\Local\Microsoft\Windows\Shell"
+        if (-not (Test-Path $shellDir)) { New-Item -Path $shellDir -ItemType Directory -Force | Out-Null }
+        Set-Content -Path (Join-Path $shellDir "LayoutModification.xml") -Value $xml -Encoding UTF8 -Force
+    }
+
+    # If the dispatcher already signed in once, its taskbar is already built and
+    # ignores the file -- clear the cached taskbar pins so it rebuilds from our
+    # layout on next logon.
+    if ($DispSid) {
+        Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+            param($root)
+            $tb = "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
+            Remove-ItemProperty -Path $tb -Name "Favorites"        -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $tb -Name "FavoritesResolve" -ErrorAction SilentlyContinue
+        }
+    }
 
     "pinned: " + (($links | ForEach-Object { Split-Path $_ -Leaf }) -join ", ")
 }
 
-Invoke-Step "Restrict dispatcher to allowed apps only (RestrictRun)" {
+Invoke-Step "Block config/escape apps for the dispatcher (DisallowRun)" {
     if (-not $DispSid) { throw "dispatcher SID not found" }
-
-    $allowed = [System.Collections.Generic.List[string]]::new()
-    foreach ($e in $DispatcherAllowedExes) { if ($e) { $allowed.Add($e) } }
-
-    # Add the real exe names of installed allowed apps so auto-start + pins work
-    $chrome = @(
-        "C:\Program Files\Google\Chrome\Application\chrome.exe",
-        "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($chrome) { $allowed.Add((Split-Path $chrome -Leaf)) }
-
-    $bria = @(
-        "C:\Program Files (x86)\CounterPath\Bria Enterprise\BriaEnterprise.exe",
-        "C:\Program Files\CounterPath\Bria Enterprise\BriaEnterprise.exe"
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($bria) { $allowed.Add((Split-Path $bria -Leaf)) }
-
-    $info = Get-UninstallInfo "Lexip Control Software"
-    if ($info -and $info.DisplayIcon) {
-        $lx = ($info.DisplayIcon -replace ',\s*\d+\s*$','').Trim('"')
-        if ($lx -and (Test-Path $lx)) { $allowed.Add((Split-Path $lx -Leaf)) }
-    }
-
-    $jabra = Get-ChildItem "C:\Program Files\Jabra","C:\Program Files (x86)\Jabra" `
-                -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-             Where-Object { $_.BaseName -match 'Jabra.?Direct' } |
-             Select-Object -First 1 -ExpandProperty FullName
-    if ($jabra) { $allowed.Add((Split-Path $jabra -Leaf)) }
-
-    $script:_AllowedExes = $allowed | Sort-Object -Unique
+    $script:_BlockedExes = @($DispatcherBlockedExes | Where-Object { $_ } | Sort-Object -Unique)
 
     Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
         param($root)
         $exp = "$root\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
-        # Allowlist mode: only the listed apps may be launched by the dispatcher
-        Set-RegValue $exp "RestrictRun" DWord 1
-        # RestrictRun supersedes DisallowRun -- clear any Edge blocklist to avoid conflict
-        Remove-ItemProperty -Path $exp -Name "DisallowRun" -ErrorAction SilentlyContinue
-        Remove-Item -Path "$exp\DisallowRun" -Recurse -Force -ErrorAction SilentlyContinue
 
-        $rr = "$exp\RestrictRun"
-        Remove-Item -Path $rr -Recurse -Force -ErrorAction SilentlyContinue
-        New-Item -Path $rr -Force | Out-Null
+        # IMPORTANT: remove any old allowlist (RestrictRun) -- that one breaks the
+        # Win11 shell (dead volume flyout, "Restrictions" popup at login).
+        Remove-ItemProperty -Path $exp -Name "RestrictRun" -ErrorAction SilentlyContinue
+        Remove-Item -Path "$exp\RestrictRun" -Recurse -Force -ErrorAction SilentlyContinue
+
+        # Blocklist mode -- everything works EXCEPT the listed apps
+        Set-RegValue $exp "DisallowRun" DWord 1
+        $dr = "$exp\DisallowRun"
+        Remove-Item -Path $dr -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -Path $dr -Force | Out-Null
         $i = 1
-        foreach ($exe in $script:_AllowedExes) { Set-RegValue $rr "$i" String $exe; $i++ }
+        foreach ($exe in $script:_BlockedExes) { Set-RegValue $dr "$i" String $exe; $i++ }
     }
 
-    "allowed: " + ($script:_AllowedExes -join ", ")
+    "blocked: " + ($script:_BlockedExes -join ", ")
 }
 
 # -----------------------------------------------------------------------------
