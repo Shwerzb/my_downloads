@@ -34,7 +34,26 @@
 ===============================================================================
 #>
 
-#Requires -RunAsAdministrator
+# ---------------------------------------------------------------------------
+#  Self-elevate: relaunch as Administrator (UAC prompt) if not already elevated
+# ---------------------------------------------------------------------------
+$__isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $__isAdmin) {
+    if (-not $PSCommandPath) {
+        Write-Host "Run this as a .ps1 file (not pasted into the console) so it can request elevation." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Requesting administrator rights -- approve the UAC prompt..." -ForegroundColor Yellow
+    try {
+        Start-Process -FilePath "$PSHOME\powershell.exe" -Verb RunAs -ArgumentList @(
+            "-NoExit","-NoProfile","-ExecutionPolicy","Bypass","-File","`"$PSCommandPath`""
+        )
+    } catch {
+        Write-Host "Elevation was cancelled -- the script did not run." -ForegroundColor Red
+        exit 1
+    }
+    exit
+}
 
 # =============================================================================
 #  CONFIG  --  EDIT THESE VALUES
