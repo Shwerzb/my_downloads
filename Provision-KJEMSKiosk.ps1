@@ -1236,17 +1236,26 @@ Invoke-Step "Set EMS desktop + lock screen wallpaper" {
     # Show the real picture on the sign-in screen instead of the blurred version
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "DisableAcrylicBackgroundOnLogon" DWord 1
 
-    # Desktop wallpaper enforced for the dispatcher (10 = Fill, crops to cover
-    # the whole screen; 6 = Fit would letterbox it)
+    # Desktop wallpaper enforced for the dispatcher, scaled to FILL the screen.
+    #
+    # CAREFUL: the two places that hold "WallpaperStyle" use DIFFERENT value sets,
+    # and the policy one wins. Putting the Control Panel number in the policy key
+    # is not an error Windows reports -- it just falls back to Center, which
+    # leaves a 1920x1080 image sitting small in the middle of a bigger screen.
+    #
+    #   Policies\System\WallpaperStyle   (Desktop.admx "Wallpaper" policy)
+    #       0 Center  1 Tile  2 Stretch  3 Fit  4 FILL  5 Span
+    #   Control Panel\Desktop\WallpaperStyle
+    #       0 Center  2 Stretch  6 Fit  10 FILL  22 Span
     if ($DispSid) {
         Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
             param($root)
             $sys = "$root\Software\Microsoft\Windows\CurrentVersion\Policies\System"
             Set-RegValue $sys "Wallpaper"      String $WallpaperDest
-            Set-RegValue $sys "WallpaperStyle" String "10"
+            Set-RegValue $sys "WallpaperStyle" String "4"      # 4 = Fill (policy enum)
             $cpd = "$root\Control Panel\Desktop"
             Set-RegValue $cpd "Wallpaper"      String $WallpaperDest
-            Set-RegValue $cpd "WallpaperStyle" String "10"
+            Set-RegValue $cpd "WallpaperStyle" String "10"     # 10 = Fill (Control Panel enum)
             Set-RegValue $cpd "TileWallpaper"  String "0"
         }
     }
