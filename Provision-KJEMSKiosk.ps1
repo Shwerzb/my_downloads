@@ -202,7 +202,12 @@ $DispatcherBlockedExes = @(
     "SystemPropertiesHardware.exe","SystemPropertiesPerformance.exe",
     # --- other apps ---------------------------------------------------------
     "AcroRd32.exe","Acrobat.exe","AcroCEF.exe","RdrCEF.exe",   # Acrobat Reader
-    "OneDrive.exe","Teams.exe","ms-teams.exe","MicrosoftEdgeUpdate.exe"
+    "OneDrive.exe","Teams.exe","ms-teams.exe","MicrosoftEdgeUpdate.exe",
+    # --- installing / fetching anything new ---------------------------------
+    "msiexec.exe","winget.exe","AppInstaller.exe","WSReset.exe",
+    "certutil.exe","bitsadmin.exe","ftp.exe","tftp.exe","curl.exe",
+    # --- accessibility backdoors used to break out of a kiosk ----------------
+    "sethc.exe","utilman.exe","atbroker.exe","DisplaySwitch.exe"
 )
 
 # ---- Dispatcher blocked Store apps -------------------------------------------
@@ -217,7 +222,10 @@ $DispatcherBlockedAppx = @(
     "Microsoft.ScreenSketch","Microsoft.WindowsAlarms","Microsoft.WindowsMaps",
     "Microsoft.WindowsSoundRecorder","Microsoft.MicrosoftStickyNotes","Microsoft.WindowsTerminal",
     "Microsoft.YourPhone","Microsoft.Windows.DevHome","Microsoft.WindowsMediaPlayer",
-    "Microsoft.ZuneVideo","Microsoft.MicrosoftJournal"
+    "Microsoft.ZuneVideo","Microsoft.MicrosoftJournal",
+    # Store + help/onboarding + the widgets host
+    "Microsoft.WindowsStore","Microsoft.StorePurchaseApp","Microsoft.DesktopAppInstaller",
+    "Microsoft.GetHelp","Microsoft.Getstarted","MicrosoftWindows.Client.WebExperience"
 )
 
 # ---- Software to install ----------------------------------------------------
@@ -635,6 +643,51 @@ function Remove-UserAndProfiles {
     Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -like "$Name*" } |
         ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+function Get-JabraExe {
+    $p = @(
+        "C:\Program Files (x86)\Jabra\Direct6\jabra-direct.exe",
+        "C:\Program Files\Jabra\Direct6\jabra-direct.exe",
+        "C:\Program Files (x86)\Jabra\Direct\jabra-direct.exe",
+        "C:\Program Files\Jabra\Direct\jabra-direct.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($p) { return $p }
+    foreach ($root in @("C:\Program Files (x86)\Jabra", "C:\Program Files\Jabra")) {
+        if (-not (Test-Path $root)) { continue }
+        $p = Get-ChildItem $root -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+             Where-Object { $_.Name -match 'jabra[- ]?direct\.exe$' } |
+             Select-Object -First 1 -ExpandProperty FullName
+        if ($p) { return $p }
+    }
+    $info = Get-UninstallInfo "Jabra Direct"
+    if ($info -and $info.InstallLocation -and (Test-Path $info.InstallLocation)) {
+        return (Get-ChildItem $info.InstallLocation -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match 'jabra' -and $_.Name -notmatch 'updat|uninst|crash|report|setup' } |
+                Select-Object -First 1 -ExpandProperty FullName)
+    }
+    return $null
+}
+
+# The MAIN Lexip control panel is lcp.exe -- NOT updater.exe and NOT the
+# firmware_update\LexipFwUpd.exe tool that just prints usage and waits.
+function Get-LexipExe {
+    $info = Get-UninstallInfo "Lexip Control Software"
+    if ($info -and $info.InstallLocation -and (Test-Path $info.InstallLocation)) {
+        $p = Get-ChildItem $info.InstallLocation -Filter "lcp.exe" -Recurse -ErrorAction SilentlyContinue |
+             Select-Object -First 1 -ExpandProperty FullName
+        if ($p) { return $p }
+        return (Get-ChildItem $info.InstallLocation -Filter *.exe -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notmatch 'updater|FwUpd|firmware' } |
+                Select-Object -First 1 -ExpandProperty FullName)
+    }
+    foreach ($root in @("C:\Program Files\Lexip", "C:\Program Files (x86)\Lexip")) {
+        if (-not (Test-Path $root)) { continue }
+        $p = Get-ChildItem $root -Recurse -Filter "lcp.exe" -ErrorAction SilentlyContinue |
+             Select-Object -First 1 -ExpandProperty FullName
+        if ($p) { return $p }
+    }
+    return $null
 }
 
 function Test-AppInstalled {
@@ -1068,6 +1121,15 @@ Invoke-Step "Put EMS shortcuts on the Chrome New Tab page" {
     if (-not $links.Count) { Skip-Step "no link URLs configured" }
     $customLinks = '{"initialized":true,"list":[' + ($links -join ',') + ']}'
 
+    # Seeding custom_links is not enough on its own: Chrome registers
+    # ntp.custom_links_visible defaulting to FALSE (chrome/browser/new_tab_page/
+    # prefs/ntp_pref_names.h), so the page keeps showing top sites -- which is the
+    # Web Store tile on a fresh profile. These four prefs switch the tile source
+    # over to our shortcuts. ntp.shortcuts_type is the legacy pref that older
+    # builds read (1 = CustomLinks).
+    $ntpPrefs = '"ntp":{"shortcust_visible":true,"custom_links_visible":true,' +
+                '"use_most_visited_tiles":false,"shortcuts_type":1}'
+
     $prefFile = Join-Path $DispChromeDef "Preferences"
     $existing = $null
     if (Test-Path $prefFile) {
@@ -1075,13 +1137,23 @@ Invoke-Step "Put EMS shortcuts on the Chrome New Tab page" {
     }
 
     if ($existing) {
-        # Keep everything Chrome already wrote; replace only custom_links
+        # Keep everything Chrome already wrote; replace only what we own
         $cl = $customLinks | ConvertFrom-Json
         if ($existing.PSObject.Properties.Name -contains 'custom_links') { $existing.custom_links = $cl }
         else { $existing | Add-Member -NotePropertyName 'custom_links' -NotePropertyValue $cl -Force }
+
+        $np = ('{' + $ntpPrefs + '}' | ConvertFrom-Json).ntp
+        if ($existing.PSObject.Properties.Name -contains 'ntp') {
+            foreach ($p in $np.PSObject.Properties) {
+                if ($existing.ntp.PSObject.Properties.Name -contains $p.Name) { $existing.ntp.($p.Name) = $p.Value }
+                else { $existing.ntp | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force }
+            }
+        } else {
+            $existing | Add-Member -NotePropertyName 'ntp' -NotePropertyValue $np -Force
+        }
         $out = $existing | ConvertTo-Json -Depth 100 -Compress
     } else {
-        $out = '{"custom_links":' + $customLinks + '}'
+        $out = '{"custom_links":' + $customLinks + ',' + $ntpPrefs + '}'
     }
     [IO.File]::WriteAllText($prefFile, $out, (New-Object Text.UTF8Encoding($false)))
 
@@ -1167,9 +1239,18 @@ Invoke-Step "Suppress Microsoft first-login prompts & suggestions" {
     Set-RegValue $cc "DisableCloudOptimizedContent"       DWord 1
     Set-RegValue $cc "DisableSoftLanding"                 DWord 1
     $ws = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search"
-    Set-RegValue $ws "AllowCortana"          DWord 0
-    Set-RegValue $ws "DisableWebSearch"      DWord 1
-    Set-RegValue $ws "ConnectedSearchUseWeb" DWord 0
+    Set-RegValue $ws "AllowCortana"                DWord 0
+    Set-RegValue $ws "DisableWebSearch"            DWord 1
+    Set-RegValue $ws "ConnectedSearchUseWeb"       DWord 0
+    Set-RegValue $ws "ConnectedSearchUseWebOverMeteredConnections" DWord 0
+    Set-RegValue $ws "AllowCloudSearch"            DWord 0
+    Set-RegValue $ws "AllowSearchToUseLocation"    DWord 0
+    Set-RegValue $ws "EnableDynamicContentInWSB"   DWord 0
+    Set-RegValue $ws "AllowSearchHighlights"       DWord 0
+
+    # The one that actually removes Bing / web results from the Windows 11 Start
+    # search box (the older Windows Search policies above no longer cover it).
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" DWord 1
 
     # Per-user (dispatcher): disable "suggested content", tips, and the
     # "Let's finish setting up your device" (SCOOBE) prompt + advertising ID
@@ -1188,6 +1269,13 @@ Invoke-Step "Suppress Microsoft first-login prompts & suggestions" {
             foreach ($v in $off) { Set-RegValue $cdm $v DWord 0 }
             Set-RegValue "$root\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" DWord 0
             Set-RegValue "$root\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" DWord 0
+
+            # No web search in the Start menu for the dispatcher
+            Set-RegValue "$root\Software\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" DWord 1
+            $usrSearch = "$root\Software\Microsoft\Windows\CurrentVersion\Search"
+            Set-RegValue $usrSearch "BingSearchEnabled"      DWord 0
+            Set-RegValue $usrSearch "CortanaConsent"         DWord 0
+            Set-RegValue $usrSearch "AllowSearchToUseLocation" DWord 0
         }
     }
 }
@@ -1281,17 +1369,22 @@ Invoke-Step "Pin only allowed apps + hide Recommended" {
         "C:\Program Files (x86)\CounterPath\Bria Enterprise\BriaEnterprise.exe",
         "C:\Program Files\CounterPath\Bria Enterprise\BriaEnterprise.exe"
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $jabra = Get-JabraExe
+    $lexip = Get-LexipExe
 
     # Build the pinned-apps JSON (backslashes are pre-escaped for JSON)
     $items = @()
-    if ($chrome) {
-        Ensure-Shortcut -Exe $chrome -Name "Google Chrome" | Out-Null
-        $items += '{"desktopAppLink":"%ALLUSERSPROFILE%\\Microsoft\\Windows\\Start Menu\\Programs\\Google Chrome.lnk"}'
+    foreach ($app in @(
+        @{ Exe = $chrome; Name = "Google Chrome"   },
+        @{ Exe = $bria;   Name = "Bria Enterprise" },
+        @{ Exe = $jabra;  Name = "Jabra Direct"    },
+        @{ Exe = $lexip;  Name = "Lexip Control"   })) {
+        if (-not $app.Exe) { continue }
+        Ensure-Shortcut -Exe $app.Exe -Name $app.Name | Out-Null
+        $items += ('{{"desktopAppLink":"%ALLUSERSPROFILE%\\Microsoft\\Windows\\Start Menu\\Programs\\{0}.lnk"}}' -f $app.Name)
     }
-    if ($bria) {
-        Ensure-Shortcut -Exe $bria -Name "Bria Enterprise" | Out-Null
-        $items += '{"desktopAppLink":"%ALLUSERSPROFILE%\\Microsoft\\Windows\\Start Menu\\Programs\\Bria Enterprise.lnk"}'
-    }
+    # Windows Settings is a packaged app, so it is pinned by its AUMID
+    $items += '{"packagedAppId":"windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"}'
 
     if ($items.Count) {
         $json = '{"pinnedList":[' + ($items -join ',') + ']}'
@@ -1319,7 +1412,13 @@ Invoke-Step "Pin only allowed apps + hide Recommended" {
         }
     }
 
-    if (-not $items.Count) { "Chrome/Bria not installed yet -- pins not set" }
+    $pinned = @()
+    if ($chrome) { $pinned += "Chrome" }
+    if ($bria)   { $pinned += "Bria" }
+    if ($jabra)  { $pinned += "Jabra Direct" }
+    if ($lexip)  { $pinned += "Lexip Control" }
+    $pinned += "Settings"
+    "pinned: " + ($pinned -join ", ")
 }
 
 Invoke-Step "Remove Microsoft bloatware apps" {
@@ -1395,6 +1494,18 @@ Invoke-Step "Dispatcher per-user lockdown (settings, OneDrive, recycle bin)" {
         Set-RegValue $exp "NoFolderOptions"  DWord 1
         Set-RegValue $exp "NoRecentDocsMenu" DWord 1
 
+        # No Run box (Win+R) and no network-connection fiddling. File Explorer
+        # itself cannot be blocked outright -- it IS the shell, and blocking
+        # explorer.exe kills the desktop and taskbar with it -- but with every
+        # drive hidden and access denied above there is nothing left to browse.
+        Set-RegValue $exp "NoRun"                  DWord 1
+        Set-RegValue $exp "NoNetConnectDisconnect" DWord 1
+        Set-RegValue $exp "NoNetHood"              DWord 1
+
+        # Turn the Microsoft Store off for this user (User Configuration >
+        # Windows Components > Store > "Turn off the Store application")
+        Set-RegValue "$root\Software\Policies\Microsoft\WindowsStore" "RemoveWindowsStore" DWord 1
+
         # Remove OneDrive auto-start
         Remove-ItemProperty -Path "$root\Software\Microsoft\Windows\CurrentVersion\Run" -Name "OneDrive" -ErrorAction SilentlyContinue
         # Hide Recycle Bin icon
@@ -1445,19 +1556,7 @@ Invoke-Step "Set dispatcher startup app (Chrome -> Hatzalah Web)" {
         "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
-    # Lexip exe -- the MAIN control panel is lcp.exe (NOT updater.exe and NOT the
-    # firmware_update\LexipFwUpd.exe tool that just prints usage and waits).
-    $lexip = $null
-    $info = Get-UninstallInfo "Lexip Control Software"
-    if ($info -and $info.InstallLocation -and (Test-Path $info.InstallLocation)) {
-        $lexip = Get-ChildItem $info.InstallLocation -Filter "lcp.exe" -Recurse -ErrorAction SilentlyContinue |
-                 Select-Object -First 1 -ExpandProperty FullName
-        if (-not $lexip) {
-            $lexip = Get-ChildItem $info.InstallLocation -Filter *.exe -ErrorAction SilentlyContinue |
-                     Where-Object { $_.Name -notmatch 'updater|FwUpd|firmware' } |
-                     Select-Object -First 1 -ExpandProperty FullName
-        }
-    }
+    $lexip = Get-LexipExe
 
     $script:_StartChrome = $chrome
     $script:_StartLexip  = $lexip
@@ -1754,30 +1853,7 @@ exit 0
 }
 
 Invoke-Step "Jabra Direct: start in the system tray at logon" {
-    $jabra = @(
-        "C:\Program Files (x86)\Jabra\Direct6\jabra-direct.exe",
-        "C:\Program Files\Jabra\Direct6\jabra-direct.exe",
-        "C:\Program Files (x86)\Jabra\Direct\jabra-direct.exe",
-        "C:\Program Files\Jabra\Direct\jabra-direct.exe"
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-    if (-not $jabra) {
-        foreach ($root in @("C:\Program Files (x86)\Jabra", "C:\Program Files\Jabra")) {
-            if (-not (Test-Path $root)) { continue }
-            $jabra = Get-ChildItem $root -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-                     Where-Object { $_.Name -match 'jabra[- ]?direct\.exe$' } |
-                     Select-Object -First 1 -ExpandProperty FullName
-            if ($jabra) { break }
-        }
-    }
-    if (-not $jabra) {
-        $info = Get-UninstallInfo "Jabra Direct"
-        if ($info -and $info.InstallLocation -and (Test-Path $info.InstallLocation)) {
-            $jabra = Get-ChildItem $info.InstallLocation -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-                     Where-Object { $_.Name -match 'jabra' -and $_.Name -notmatch 'updat|uninst|crash|report|setup' } |
-                     Select-Object -First 1 -ExpandProperty FullName
-        }
-    }
+    $jabra = Get-JabraExe
     if (-not $jabra) { Skip-Step "Jabra Direct not installed yet" }
 
     Remove-VendorAutostart -Match "jabra"
@@ -1786,14 +1862,7 @@ Invoke-Step "Jabra Direct: start in the system tray at logon" {
 }
 
 Invoke-Step "Lexip Control: start in the system tray at logon" {
-    $lexip = $script:_StartLexip
-    if (-not $lexip) {
-        $info = Get-UninstallInfo "Lexip Control Software"
-        if ($info -and $info.InstallLocation -and (Test-Path $info.InstallLocation)) {
-            $lexip = Get-ChildItem $info.InstallLocation -Filter "lcp.exe" -Recurse -ErrorAction SilentlyContinue |
-                     Select-Object -First 1 -ExpandProperty FullName
-        }
-    }
+    $lexip = Get-LexipExe
     if (-not $lexip) { Skip-Step "Lexip Control Software not installed yet" }
 
     Remove-VendorAutostart -Match "lexip"
