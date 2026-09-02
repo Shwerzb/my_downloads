@@ -205,6 +205,21 @@ $DispatcherBlockedExes = @(
     "OneDrive.exe","Teams.exe","ms-teams.exe","MicrosoftEdgeUpdate.exe"
 )
 
+# ---- Dispatcher blocked Store apps -------------------------------------------
+# DisallowRun above cannot stop a packaged (Store/UWP) app -- the shell activates
+# those, it is not a CreateProcess -- and uninstalling the package machine-wide
+# would take it away from the admin too. So these are de-registered for the
+# DISPATCHER ACCOUNT ONLY, by a logon task that runs as that user. The admin
+# keeps Calculator, Notepad, Paint and the rest.
+$DispatcherBlockedAppx = @(
+    "Microsoft.WindowsCalculator","Microsoft.WindowsNotepad","Microsoft.Paint","Microsoft.MSPaint",
+    "Microsoft.Paint3D","Microsoft.Microsoft3DViewer","Microsoft.Windows.Photos","Microsoft.WindowsCamera",
+    "Microsoft.ScreenSketch","Microsoft.WindowsAlarms","Microsoft.WindowsMaps",
+    "Microsoft.WindowsSoundRecorder","Microsoft.MicrosoftStickyNotes","Microsoft.WindowsTerminal",
+    "Microsoft.YourPhone","Microsoft.Windows.DevHome","Microsoft.WindowsMediaPlayer",
+    "Microsoft.ZuneVideo","Microsoft.MicrosoftJournal"
+)
+
 # ---- Software to install ----------------------------------------------------
 # Each entry:
 #   Name    = friendly label shown in the summary
@@ -1315,16 +1330,11 @@ Invoke-Step "Remove Microsoft bloatware apps" {
         "Microsoft.Todos","Microsoft.PowerAutomateDesktop","*Clipchamp*","*Teams*","MicrosoftTeams",
         "Microsoft.WindowsFeedbackHub","Microsoft.GetHelp","Microsoft.Getstarted","Microsoft.MicrosoftOfficeHub",
         "*WhatsApp*","*LinkedIn*","*Spotify*","*Disney*","*Facebook*","*Instagram*","*Prime*","*TikTok*",
-        "Microsoft.549981C3F5F10","Microsoft.MixedReality.Portal","Microsoft.OutlookForWindows",
-        # Accessories: a UWP app is activated by the shell, not by CreateProcess,
-        # so DisallowRun cannot stop it -- the package itself has to go.
-        "Microsoft.WindowsCalculator","Microsoft.WindowsNotepad","Microsoft.Paint","Microsoft.MSPaint",
-        "Microsoft.Paint3D","Microsoft.Microsoft3DViewer","Microsoft.Windows.Photos","Microsoft.WindowsCamera",
-        "Microsoft.ScreenSketch","Microsoft.WindowsAlarms","Microsoft.WindowsMaps",
-        "Microsoft.WindowsSoundRecorder","Microsoft.MicrosoftStickyNotes","Microsoft.WindowsTerminal",
-        "Microsoft.YourPhone","Microsoft.Windows.DevHome","MicrosoftWindows.Client.WebExperience",
-        "Microsoft.WindowsMediaPlayer","Microsoft.ZuneVideo","Microsoft.MicrosoftJournal"
+        "Microsoft.549981C3F5F10","Microsoft.MixedReality.Portal","Microsoft.OutlookForWindows"
     )
+    # NOTE: accessories (Calculator, Notepad, Paint, ...) are deliberately NOT in
+    # this list -- it uninstalls machine-wide and the admin needs them. They are
+    # taken away from the DISPATCHER only, see $DispatcherBlockedAppx.
     $removed = 0
     foreach ($p in $patterns) {
         Get-AppxPackage -AllUsers -Name $p -ErrorAction SilentlyContinue | ForEach-Object {
@@ -1789,6 +1799,42 @@ Invoke-Step "Lexip Control: start in the system tray at logon" {
     Remove-VendorAutostart -Match "lexip"
     Register-TrayAppTask -TaskName "KJEMS Lexip Control (tray)" -Exe $lexip -Delay "PT35S"
     "tray launch: $lexip"
+}
+
+Invoke-Step "Take accessory apps away from $DispatcherUser only" {
+    if (-not $DispatcherBlockedAppx -or $DispatcherBlockedAppx.Count -eq 0) { Skip-Step "none configured" }
+
+    # Remove-AppxPackage run AS the dispatcher de-registers the app for that
+    # account alone; every other account (the admin) keeps it. It has to run in
+    # the dispatcher's own session, hence a logon task. It re-runs at every logon
+    # so an app that Windows re-registers after an update goes away again.
+    $helper = Join-Path $LogDir "Remove-DispatcherApps.ps1"
+    $list   = ($DispatcherBlockedAppx | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ","
+    $body   = @"
+# KJ EMS kiosk -- runs as the dispatcher at logon.
+# Removes these Store apps for THIS USER ONLY. Nothing is uninstalled
+# machine-wide, so the admin account keeps all of them.
+`$ErrorActionPreference = 'SilentlyContinue'
+foreach (`$p in @($list)) {
+    Get-AppxPackage -Name `$p | ForEach-Object { Remove-AppxPackage -Package `$_.PackageFullName }
+}
+exit 0
+"@
+    Set-Content -Path $helper -Value $body -Encoding UTF8 -Force
+
+    $psExe = Join-Path $PSHOME "powershell.exe"
+    $arg   = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $helper
+
+    $action    = New-ScheduledTaskAction -Execute $psExe -Argument $arg
+    $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $DispatcherUser
+    $trigger.Delay = "PT10S"
+    $principal = New-ScheduledTaskPrincipal -UserId $DispatcherUser -LogonType Interactive -RunLevel Limited
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                    -StartWhenAvailable -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+    Register-ScheduledTask -TaskName "KJEMS Dispatcher app cleanup" -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Force | Out-Null
+
+    "{0} app(s) removed at {1}'s logon -- admin keeps them" -f $DispatcherBlockedAppx.Count, $DispatcherUser
 }
 
 # -----------------------------------------------------------------------------
