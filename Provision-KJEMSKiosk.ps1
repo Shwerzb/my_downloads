@@ -1329,8 +1329,65 @@ Invoke-Step "Power: max performance, screen never off, no sleep" {
     powercfg /setacvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0 2>$null
     powercfg /setdcvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0 2>$null
 
+    # "Require a password on wakeup" = No, so a nudge brings the kiosk straight back
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0 2>$null
+    powercfg /setdcvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0 2>$null
+
     powercfg -hibernate off 2>$null
     powercfg -setactive SCHEME_CURRENT 2>$null
+
+    # A screen saver would blank the screen even with the display timeout at 0
+    if ($DispSid) {
+        Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+            param($root)
+            $cpd = "$root\Control Panel\Desktop"
+            Set-RegValue $cpd "ScreenSaveActive"    String "0"
+            Set-RegValue $cpd "ScreenSaveTimeOut"   String "0"
+            Set-RegValue $cpd "ScreenSaverIsSecure" String "0"
+            Remove-ItemProperty -Path $cpd -Name "SCRNSAVE.EXE" -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Invoke-Step "Turn Windows location services ON (Chrome needs it)" {
+    # Chrome asks Windows for the position, so the OS location switch has to be
+    # on -- the site-level GeolocationAllowedForUrls policy is not enough on its own.
+    $notes = @()
+
+    # Master switch + the service itself
+    try {
+        Set-RegValue "HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration" "Status" DWord 1
+    } catch { $notes += "lfsvc Status locked" }
+    try {
+        Set-Service -Name lfsvc -StartupType Automatic -ErrorAction Stop
+        Start-Service -Name lfsvc -ErrorAction SilentlyContinue
+    } catch { $notes += "lfsvc service" }
+
+    # Make sure no policy switches it back off
+    $las = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors"
+    Set-RegValue $las "DisableLocation"                DWord 0
+    Set-RegValue $las "DisableLocationScripting"       DWord 0
+    Set-RegValue $las "DisableWindowsLocationProvider" DWord 0
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" "LetAppsAccessLocation" DWord 1
+
+    # Allow location for apps AND for desktop (non-packaged) apps -- Chrome is a
+    # desktop app, and that second switch is the one that is usually missed.
+    $cs = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
+    Set-RegValue $cs             "Value" String "Allow"
+    Set-RegValue "$cs\NonPackaged" "Value" String "Allow"
+
+    # Same again inside the dispatcher's own profile
+    if ($DispSid) {
+        Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+            param($root)
+            $ucs = "$root\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
+            Set-RegValue $ucs              "Value" String "Allow"
+            Set-RegValue "$ucs\NonPackaged" "Value" String "Allow"
+        }
+    }
+
+    if ($notes.Count) { "location allowed for desktop apps; not fully applied: " + ($notes -join ", ") }
+    else { "location service on, allowed for desktop apps (Chrome) machine-wide and for $DispatcherUser" }
 }
 
 Invoke-Step "Set Chrome as default browser" {
@@ -1501,6 +1558,11 @@ Invoke-Step "Dispatcher per-user lockdown (settings, OneDrive, recycle bin)" {
         Set-RegValue $exp "NoRun"                  DWord 1
         Set-RegValue $exp "NoNetConnectDisconnect" DWord 1
         Set-RegValue $exp "NoNetHood"              DWord 1
+
+        # Explorer reads this at logon and swallows the listed Win+<key> combos:
+        # E = File Explorer, R = Run box, X = the power-user menu. Without this,
+        # Win+E still opens an Explorer window even with everything else locked.
+        Set-RegValue "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "DisabledHotkeys" String "ERX"
 
         # Turn the Microsoft Store off for this user (User Configuration >
         # Windows Components > Store > "Turn off the Store application")
