@@ -17,8 +17,11 @@
        an installer starts is left running -- apps come up at dispatcher login
    7.  Apply the Chrome kiosk policy (allow/block list, extensions, hardening)
        to the DISPATCHER ONLY  -- the admin keeps a normal Chrome
-   8.  Put the EMS links on the Chrome BOOKMARKS BAR (not the desktop)
-   9.  Disable Windows 11 widgets, set wallpaper/lock screen
+   8.  Put the EMS links on the Chrome BOOKMARKS BAR *and* on the New Tab page
+       as shortcut tiles (Hatzalah Web first, no Web Store tile) -- not on the
+       Windows desktop
+   9.  Disable Windows 11 widgets, set the wallpaper (Fill) on the desktop,
+       the lock screen and the sign-in screen
    9b. Block Edge for the dispatcher + kill Microsoft first-login prompts
        ("finish setting up your device", privacy screen, tips, suggested apps)
    10. Disable Google / Edge / OneDrive updaters
@@ -146,8 +149,9 @@ $ChromeSitePermissionUrls = @(
     "[*.]teamconnectapp.com"
 )
 
-# EMS links placed on the dispatcher's Chrome BOOKMARKS BAR (name -> URL).
-# These are browser bookmarks -- nothing is put on the Windows desktop.
+# EMS links for the dispatcher's Chrome (name -> URL). The same list becomes
+# BOTH the bookmarks bar AND the shortcut tiles on the New Tab page, in this
+# order -- so Hatzalah Web is the first tile. Nothing goes on the Windows desktop.
 $ChromeBookmarks = @(
     @{ Name = "Hatzalah Web"; Url = "https://hatzalahweb.datavanced.com" },
     @{ Name = "Team Connect"; Url = "https://www.teamconnectapp.com" },
@@ -158,6 +162,7 @@ $ChromeBookmarks = @(
 # Shortcuts that must NOT be on the dispatcher desktop (deleted on every run)
 $DesktopShortcutsToRemove = @(
     "Volume Control", "Microsoft Edge",
+    "Adobe", "Acrobat",                       # Acrobat Reader DC & friends
     "Hatzalah Web", "Team Connect", "Maps", "PCR"
 )
 
@@ -166,15 +171,38 @@ $DesktopShortcutsToRemove = @(
 # name). A blocklist keeps the Windows shell fully working (taskbar, volume,
 # tray, startup apps) -- a strict allowlist breaks all of that. Add any other
 # apps you want to keep the dispatcher out of.
+# NOTE: this is a BLOCK list, not an allow list. A strict allow list
+# (RestrictRun) kills the Windows 11 shell -- dead volume flyout, a
+# "Restrictions" popup at every logon -- which is why the kiosk uses a wide
+# block list instead. Add any other app you want the dispatcher kept out of.
 $DispatcherBlockedExes = @(
     "msedge.exe",                                          # Edge -- stay on Chrome
     "iexplore.exe","firefox.exe","opera.exe","brave.exe","chromium.exe",  # other browsers
     "cmd.exe","powershell.exe","powershell_ise.exe","pwsh.exe",           # shells
+    "wt.exe","WindowsTerminal.exe","OpenConsole.exe","bash.exe","wsl.exe",# terminals
     "regedit.exe","regedt32.exe",                          # registry
     "taskmgr.exe",                                         # task manager
     "mmc.exe","gpedit.exe","secpol.exe","lusrmgr.exe","compmgmt.exe",     # admin consoles
     "msconfig.exe","control.exe","cscript.exe","wscript.exe",             # config/scripting
-    "WinStore.App.exe"                                     # Microsoft Store
+    "mshta.exe","wmic.exe","schtasks.exe","reg.exe","runas.exe","net.exe","net1.exe",
+    "WinStore.App.exe",                                    # Microsoft Store
+    # --- accessories the dispatcher has no use for -------------------------
+    "calc.exe","CalculatorApp.exe","Calculator.exe",       # Calculator
+    "notepad.exe","wordpad.exe","write.exe",               # text editors
+    "mspaint.exe","PaintStudio.View.exe","Paint.exe",      # Paint
+    "SnippingTool.exe","ScreenSketch.exe","SnipandSketch.exe",
+    "charmap.exe","magnify.exe","osk.exe","Narrator.exe",
+    "WindowsCamera.exe","Photos.exe","Video.UI.exe","Music.UI.exe",
+    "SoundRecorder.exe","StickyNot.exe","Time.exe","WinMail.exe",
+    # --- system tools / escape hatches --------------------------------------
+    "mstsc.exe","rstrui.exe","cleanmgr.exe","dfrgui.exe",
+    "dxdiag.exe","msinfo32.exe","resmon.exe","perfmon.exe","eventvwr.exe",
+    "SystemPropertiesAdvanced.exe","SystemPropertiesProtection.exe",
+    "SystemPropertiesRemote.exe","SystemPropertiesComputerName.exe",
+    "SystemPropertiesHardware.exe","SystemPropertiesPerformance.exe",
+    # --- other apps ---------------------------------------------------------
+    "AcroRd32.exe","Acrobat.exe","AcroCEF.exe","RdrCEF.exe",   # Acrobat Reader
+    "OneDrive.exe","Teams.exe","ms-teams.exe","MicrosoftEdgeUpdate.exe"
 )
 
 # ---- Software to install ----------------------------------------------------
@@ -486,6 +514,12 @@ function Set-RegValue {
     param([string]$Path,[string]$Name,[string]$Type,$Value)
     if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
     New-ItemProperty -Path $Path -Name $Name -PropertyType $Type -Value $Value -Force | Out-Null
+}
+
+# Escapes a string for embedding in hand-built JSON
+function ConvertTo-JsonText {
+    param([string]$Text)
+    ($Text -replace '\\', '\\') -replace '"', '\"'
 }
 
 function Get-UserSid {
@@ -903,7 +937,10 @@ Invoke-Step "Apply Chrome policy to $DispatcherUser" {
         Remove-Item $su -Recurse -Force -ErrorAction SilentlyContinue
         New-Item -Path $su -Force | Out-Null
         $i = 1; foreach ($u in $ChromeStartupSites) { Set-RegValue $su "$i" String $u; $i++ }
-        Set-RegValue $base "NewTabPageLocation"  String $KioskUrl
+        # The New Tab page stays Chrome's own page so the EMS shortcut tiles show
+        # on it (see the "New Tab page shortcuts" step). Chrome still OPENS on
+        # Hatzalah Web via RestoreOnStartup, and the home button goes there too.
+        Remove-ItemProperty -Path $base -Name "NewTabPageLocation" -ErrorAction SilentlyContinue
         Set-RegValue $base "HomepageIsNewTabPage" DWord 0
         Set-RegValue $base "HomepageLocation"     String $KioskUrl
         Set-RegValue $base "ShowHomeButton"       DWord 1
@@ -958,8 +995,6 @@ Invoke-Step "Put EMS links on the Chrome bookmarks bar" {
     if (Test-Path $BookmarksSrc) { Skip-Step "a custom 'Bookmarks' file was imported -- leaving it untouched" }
     if (-not (Test-Path $DispChromeDef)) { New-Item -Path $DispChromeDef -ItemType Directory -Force | Out-Null }
 
-    function ConvertTo-JsonText { param([string]$Text) ($Text -replace '\\', '\\' ) -replace '"', '\"' }
-
     # Chrome timestamps: microseconds since 1601-01-01 UTC
     $epoch = New-Object DateTime(1601, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc))
     $now   = [long](([datetime]::UtcNow - $epoch).TotalMilliseconds * 1000)
@@ -999,6 +1034,45 @@ $($kids -join ",`r`n")
     "bookmarks bar: " + (($ChromeBookmarks | ForEach-Object { $_.Name }) -join ", ")
 }
 
+Invoke-Step "Put EMS shortcuts on the Chrome New Tab page" {
+    # The tiles on the New Tab page are Chrome's "custom links". Seeding them
+    # switches the New Tab page out of "most visited" mode, which is what puts the
+    # Web Store tile there on a fresh profile -- so the Web Store tile goes away
+    # and these four are shown instead, Hatzalah Web first.
+    if (-not $ChromeBookmarks -or $ChromeBookmarks.Count -eq 0) { Skip-Step "no links configured" }
+    if (-not (Test-Path $DispChromeDef)) { New-Item -Path $DispChromeDef -ItemType Directory -Force | Out-Null }
+
+    $links = @()
+    foreach ($b in $ChromeBookmarks) {
+        if (-not $b.Url) { continue }
+        # Chrome stores the canonical URL (a bare host gets a trailing slash)
+        $u = try { ([uri]$b.Url).AbsoluteUri } catch { $b.Url }
+        $links += ('{{"url":"{0}","title":"{1}","isMostVisited":false}}' -f `
+                   (ConvertTo-JsonText $u), (ConvertTo-JsonText $b.Name))
+    }
+    if (-not $links.Count) { Skip-Step "no link URLs configured" }
+    $customLinks = '{"initialized":true,"list":[' + ($links -join ',') + ']}'
+
+    $prefFile = Join-Path $DispChromeDef "Preferences"
+    $existing = $null
+    if (Test-Path $prefFile) {
+        try { $existing = Get-Content $prefFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { $existing = $null }
+    }
+
+    if ($existing) {
+        # Keep everything Chrome already wrote; replace only custom_links
+        $cl = $customLinks | ConvertFrom-Json
+        if ($existing.PSObject.Properties.Name -contains 'custom_links') { $existing.custom_links = $cl }
+        else { $existing | Add-Member -NotePropertyName 'custom_links' -NotePropertyValue $cl -Force }
+        $out = $existing | ConvertTo-Json -Depth 100 -Compress
+    } else {
+        $out = '{"custom_links":' + $customLinks + '}'
+    }
+    [IO.File]::WriteAllText($prefFile, $out, (New-Object Text.UTF8Encoding($false)))
+
+    "new tab tiles: " + (($ChromeBookmarks | ForEach-Object { $_.Name }) -join ", ")
+}
+
 # -----------------------------------------------------------------------------
 # 9. Disable Windows 11 widgets
 # -----------------------------------------------------------------------------
@@ -1035,19 +1109,33 @@ Invoke-Step "Set EMS desktop + lock screen wallpaper" {
     if (-not (Test-Path $WallpaperSrc)) { Skip-Step "wallpaper not found and download failed" }
     Copy-Item $WallpaperSrc $WallpaperDest -Force
 
-    # Lock screen for ALL users (machine policy)
+    # Lock screen for ALL users (machine policy). Windows 11 *Pro* ignores this
+    # one -- it is Enterprise/Education only -- so PersonalizationCSP below is
+    # what actually paints the lock and sign-in screens here. Both are set.
     Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization" "LockScreenImage" String $WallpaperDest
 
-    # Desktop wallpaper enforced for the dispatcher (6 = Fit to screen)
+    $csp = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"
+    Set-RegValue $csp "LockScreenImagePath"   String $WallpaperDest
+    Set-RegValue $csp "LockScreenImageUrl"    String $WallpaperDest
+    Set-RegValue $csp "LockScreenImageStatus" DWord  1
+    Set-RegValue $csp "DesktopImagePath"      String $WallpaperDest
+    Set-RegValue $csp "DesktopImageUrl"       String $WallpaperDest
+    Set-RegValue $csp "DesktopImageStatus"    DWord  1
+
+    # Show the real picture on the sign-in screen instead of the blurred version
+    Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "DisableAcrylicBackgroundOnLogon" DWord 1
+
+    # Desktop wallpaper enforced for the dispatcher (10 = Fill, crops to cover
+    # the whole screen; 6 = Fit would letterbox it)
     if ($DispSid) {
         Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
             param($root)
             $sys = "$root\Software\Microsoft\Windows\CurrentVersion\Policies\System"
             Set-RegValue $sys "Wallpaper"      String $WallpaperDest
-            Set-RegValue $sys "WallpaperStyle" String "6"
+            Set-RegValue $sys "WallpaperStyle" String "10"
             $cpd = "$root\Control Panel\Desktop"
             Set-RegValue $cpd "Wallpaper"      String $WallpaperDest
-            Set-RegValue $cpd "WallpaperStyle" String "6"
+            Set-RegValue $cpd "WallpaperStyle" String "10"
             Set-RegValue $cpd "TileWallpaper"  String "0"
         }
     }
@@ -1227,7 +1315,15 @@ Invoke-Step "Remove Microsoft bloatware apps" {
         "Microsoft.Todos","Microsoft.PowerAutomateDesktop","*Clipchamp*","*Teams*","MicrosoftTeams",
         "Microsoft.WindowsFeedbackHub","Microsoft.GetHelp","Microsoft.Getstarted","Microsoft.MicrosoftOfficeHub",
         "*WhatsApp*","*LinkedIn*","*Spotify*","*Disney*","*Facebook*","*Instagram*","*Prime*","*TikTok*",
-        "Microsoft.549981C3F5F10","Microsoft.MixedReality.Portal","Microsoft.OutlookForWindows"
+        "Microsoft.549981C3F5F10","Microsoft.MixedReality.Portal","Microsoft.OutlookForWindows",
+        # Accessories: a UWP app is activated by the shell, not by CreateProcess,
+        # so DisallowRun cannot stop it -- the package itself has to go.
+        "Microsoft.WindowsCalculator","Microsoft.WindowsNotepad","Microsoft.Paint","Microsoft.MSPaint",
+        "Microsoft.Paint3D","Microsoft.Microsoft3DViewer","Microsoft.Windows.Photos","Microsoft.WindowsCamera",
+        "Microsoft.ScreenSketch","Microsoft.WindowsAlarms","Microsoft.WindowsMaps",
+        "Microsoft.WindowsSoundRecorder","Microsoft.MicrosoftStickyNotes","Microsoft.WindowsTerminal",
+        "Microsoft.YourPhone","Microsoft.Windows.DevHome","MicrosoftWindows.Client.WebExperience",
+        "Microsoft.WindowsMediaPlayer","Microsoft.ZuneVideo","Microsoft.MicrosoftJournal"
     )
     $removed = 0
     foreach ($p in $patterns) {
@@ -1280,6 +1376,15 @@ Invoke-Step "Dispatcher per-user lockdown (settings, OneDrive, recycle bin)" {
         # Only show Wi-Fi / sound / bluetooth in Settings
         $exp = "$root\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
         Set-RegValue $exp "SettingsPageVisibility" String "showonly:network-wifi;sound;bluetooth"
+        # No file browsing: hide every drive letter in This PC and deny access to
+        # them from Explorer and the common file dialogs (0x03FFFFFF = A: .. Z:).
+        # This is what closes the "my files" route out of the kiosk. Apps are not
+        # affected -- only the Explorer namespace is.
+        Set-RegValue $exp "NoDrives"         DWord 0x03FFFFFF
+        Set-RegValue $exp "NoViewOnDrive"    DWord 0x03FFFFFF
+        Set-RegValue $exp "NoFolderOptions"  DWord 1
+        Set-RegValue $exp "NoRecentDocsMenu" DWord 1
+
         # Remove OneDrive auto-start
         Remove-ItemProperty -Path "$root\Software\Microsoft\Windows\CurrentVersion\Run" -Name "OneDrive" -ErrorAction SilentlyContinue
         # Hide Recycle Bin icon
