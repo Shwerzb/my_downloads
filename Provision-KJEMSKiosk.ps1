@@ -141,6 +141,10 @@ $ChromeAllowedSites = @(
     "*.google.com/maps/*"
 )
 
+# Default page zoom for the dispatcher's Chrome, in percent. Chrome's own preset
+# steps are 25 33 50 67 75 80 90 100 110 125 150 175 200 ...; 100 = no zoom.
+$ChromeZoomPercent = 80
+
 $ChromeWebStoreUpdateUrl = "https://clients2.google.com/service/update2/crx"
 
 # Sites granted Location (geolocation) + Pop-up permission in the dispatcher Chrome
@@ -1102,7 +1106,7 @@ $($kids -join ",`r`n")
     "bookmarks bar: " + (($ChromeBookmarks | ForEach-Object { $_.Name }) -join ", ")
 }
 
-Invoke-Step "Put EMS shortcuts on the Chrome New Tab page" {
+Invoke-Step "Chrome profile: New Tab shortcuts + ${ChromeZoomPercent}% zoom" {
     # The tiles on the New Tab page are Chrome's "custom links". Seeding them
     # switches the New Tab page out of "most visited" mode, which is what puts the
     # Web Store tile there on a fresh profile -- so the Web Store tile goes away
@@ -1130,34 +1134,54 @@ Invoke-Step "Put EMS shortcuts on the Chrome New Tab page" {
     $ntpPrefs = '"ntp":{"shortcust_visible":true,"custom_links_visible":true,' +
                 '"use_most_visited_tiles":false,"shortcuts_type":1}'
 
+    # Chrome has no zoom policy, so the profile pref is set directly. Chrome
+    # stores a zoom LEVEL, not a percentage: level = log(factor) / log(1.2)
+    # (blink's kTextSizeMultiplierRatio), in a dictionary keyed by storage
+    # partition -- "x" on current Chrome, "0" on older builds, so both are set.
+    # 80% -> -1.2239728...
+    $zoomLevel = 0.0
+    if ($ChromeZoomPercent -and $ChromeZoomPercent -ne 100) {
+        $zoomLevel = [math]::Log(($ChromeZoomPercent / 100.0)) / [math]::Log(1.2)
+    }
+    $zl = $zoomLevel.ToString("R", [Globalization.CultureInfo]::InvariantCulture)
+    $zoomPrefs = '"partition":{"default_zoom_level":{"x":' + $zl + ',"0":' + $zl + '}}'
+
     $prefFile = Join-Path $DispChromeDef "Preferences"
     $existing = $null
     if (Test-Path $prefFile) {
         try { $existing = Get-Content $prefFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { $existing = $null }
     }
 
+    # Merges our keys into a section without disturbing anything else Chrome
+    # keeps there (e.g. partition.per_host_zoom_levels).
+    function Merge-PrefSection {
+        param($Root, [string]$Name, $Value)
+        if ($Root.PSObject.Properties.Name -contains $Name) {
+            foreach ($p in $Value.PSObject.Properties) {
+                if ($Root.$Name.PSObject.Properties.Name -contains $p.Name) { $Root.$Name.($p.Name) = $p.Value }
+                else { $Root.$Name | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force }
+            }
+        } else {
+            $Root | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
+        }
+    }
+
     if ($existing) {
-        # Keep everything Chrome already wrote; replace only what we own
+        # Keep everything Chrome already wrote; touch only what we own
         $cl = $customLinks | ConvertFrom-Json
         if ($existing.PSObject.Properties.Name -contains 'custom_links') { $existing.custom_links = $cl }
         else { $existing | Add-Member -NotePropertyName 'custom_links' -NotePropertyValue $cl -Force }
 
-        $np = ('{' + $ntpPrefs + '}' | ConvertFrom-Json).ntp
-        if ($existing.PSObject.Properties.Name -contains 'ntp') {
-            foreach ($p in $np.PSObject.Properties) {
-                if ($existing.ntp.PSObject.Properties.Name -contains $p.Name) { $existing.ntp.($p.Name) = $p.Value }
-                else { $existing.ntp | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force }
-            }
-        } else {
-            $existing | Add-Member -NotePropertyName 'ntp' -NotePropertyValue $np -Force
-        }
+        Merge-PrefSection $existing 'ntp'       (('{' + $ntpPrefs  + '}') | ConvertFrom-Json).ntp
+        Merge-PrefSection $existing 'partition' (('{' + $zoomPrefs + '}') | ConvertFrom-Json).partition
         $out = $existing | ConvertTo-Json -Depth 100 -Compress
     } else {
-        $out = '{"custom_links":' + $customLinks + ',' + $ntpPrefs + '}'
+        $out = '{"custom_links":' + $customLinks + ',' + $ntpPrefs + ',' + $zoomPrefs + '}'
     }
     [IO.File]::WriteAllText($prefFile, $out, (New-Object Text.UTF8Encoding($false)))
 
-    "new tab tiles: " + (($ChromeBookmarks | ForEach-Object { $_.Name }) -join ", ")
+    "new tab tiles: " + (($ChromeBookmarks | ForEach-Object { $_.Name }) -join ", ") +
+        ("  |  zoom {0}%" -f $ChromeZoomPercent)
 }
 
 # -----------------------------------------------------------------------------
