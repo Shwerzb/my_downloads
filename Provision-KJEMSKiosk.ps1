@@ -7,12 +7,14 @@
    1.  Relax the local password policy so short passwords are allowed
    2.  Create the local ADMIN account   (skips if it already exists)
    3.  Create the dispatcher account     (skips if it already exists)
-   4.  Set passwords + "never expires"
+   4.  Set passwords + "never expires" (incl. any $SharedPasswordUsers account,
+       e.g. the OEM "User" account, which gets the admin's password)
    5.  Create the dispatcher profile on disk WITHOUT needing an interactive
        logon (Win32 CreateProfile) so per-user settings can be applied in one pass
    6.  Install software (VC++, Chrome, ScreenConnect, Bria, Jabra, Lexip)
        -- fully unattended: silent switches with fallbacks, hidden windows and a
-       per-installer timeout, so the run NEVER waits for a keypress
+       per-installer timeout, so the run NEVER waits for a keypress, and nothing
+       an installer starts is left running -- apps come up at dispatcher login
    7.  Apply the Chrome kiosk policy (allow/block list, extensions, hardening)
        to the DISPATCHER ONLY  -- the admin keeps a normal Chrome
    8.  Put the EMS links on the Chrome BOOKMARKS BAR (not the desktop)
@@ -82,6 +84,12 @@ $LegacyDispatcherUsers = @("kioskUser0")
 
 $AdminUser          = "Berish"           # local admin account name
 $AdminFullName      = "Berish"
+
+# Other local accounts that must end up with the SAME password as $AdminUser --
+# e.g. the OEM "User" account Windows ships with. When the admin account is
+# created this run its password is reused automatically; when the admin already
+# exists the script asks once (press Enter twice to leave these accounts alone).
+$SharedPasswordUsers = @("User")
 # NOTE: the admin password is NOT stored here -- the script prompts you to type
 #       it (twice, hidden) when it runs.
 
@@ -184,7 +192,10 @@ $DispatcherBlockedExes = @(
 # Apps without a public silent URL (Bria/Jabra/Lexip): drop the installer in the
 # "Installers" folder next to this script using the File name shown, or set Url.
 $MsiSilent = @('/qn /norestart', '/quiet /norestart')
-$ExeSilent = @('/install /quiet /norestart', '/exenoui /qn', '/quiet', '/silent', '/S', '/s')
+# Advanced Installer packages (Jabra, Lexip) want /exenoui /qn and answer anything
+# else with 0xE0000001 (-536870911), so that set is tried first; Burn/NSIS/Inno
+# styles follow. Whichever set the package does not reject is the one used.
+$ExeSilent = @('/exenoui /qn', '/install /quiet /norestart', '/quiet', '/silent', '/verysilent', '/S', '/s')
 
 $Software = @(
     @{ Name='Microsoft Visual C++ 2015-2022 x64'; Detect='Visual C++ 2015-2022 Redistributable (x64)';
@@ -193,7 +204,7 @@ $Software = @(
 
     @{ Name='Google Chrome';                       Detect='Google Chrome';
        Url='https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi'; File='googlechromestandaloneenterprise64.msi';
-       ArgsList=$MsiSilent; Kind='msi' }
+       ArgsList=$MsiSilent; Kind='msi'; StopAfter=@('chrome','GoogleUpdate') }
 
     @{ Name='ScreenConnect (KJEMS)';               Detect='ScreenConnect Client';
        Url='https://kjems.screenconnect.com/Bin/ScreenConnect.ClientSetup.msi?e=Access&y=Guest'; File='screenconnect.msi';
@@ -201,15 +212,15 @@ $Software = @(
 
     @{ Name='Bria Enterprise';                     Detect='Bria Enterprise';
        Url='https://www.counterpath.com/EnterpriseForWindows'; File='Bria_Enterprise.msi';
-       ArgsList=$MsiSilent; Kind='msi' }   # 301/302 -> S3 -> Bria_Enterprise_6.8.8_*.msi
+       ArgsList=$MsiSilent; Kind='msi'; StopAfter=@('BriaEnterprise','Bria') }   # 301/302 -> S3 -> Bria_Enterprise_6.8.8_*.msi
 
     @{ Name='Jabra Direct';                        Detect='Jabra Direct';
        Url='https://jabraxpressonlineprdstor.blob.core.windows.net/jdo/JabraDirectSetup.exe'; File='JabraDirectSetup.exe';
-       ArgsList=$ExeSilent; Kind='exe' }   # Advanced Installer pkg -- switch set auto-detected
+       ArgsList=$ExeSilent; Kind='exe'; StopAfter=@('jabra-direct','JabraDirect','JabraChromeHost','JabraSDKService') }
 
     @{ Name='Lexip Control Software 4';            Detect='Lexip Control Software';
        Url='https://lcs.lexip.co/download/lcp/win'; File='lexip_control_software_4.exe';
-       ArgsList=$ExeSilent; Kind='exe' }   # Advanced Installer pkg -- switch set auto-detected
+       ArgsList=$ExeSilent; Kind='exe'; StopAfter=@('lcp','LexipControlSoftware','Lexip') }
 )
 
 # ---- Paths ------------------------------------------------------------------
@@ -409,6 +420,22 @@ function Get-Installer {
 # Runs an installer completely unattended: hidden window, no console inherited,
 # a hard timeout, and a walk through the candidate silent-switch sets so we never
 # fall back to an interactive UI that waits for a click or a keypress.
+# A download that went wrong (an HTML error page, a truncated file) must not be
+# handed to msiexec -- check the magic bytes first.
+function Test-InstallerFile {
+    param([string]$Path, [string]$Kind)
+    if (-not (Test-Path $Path)) { return $false }
+    $b = New-Object byte[] 8
+    $fs = [IO.File]::OpenRead($Path)
+    try { $n = $fs.Read($b, 0, 8) } finally { $fs.Close() }
+    if ($n -lt 4) { return $false }
+    if ($Kind -eq 'msi') {
+        # MSI = OLE compound document: D0 CF 11 E0
+        return ($b[0] -eq 0xD0 -and $b[1] -eq 0xCF -and $b[2] -eq 0x11 -and $b[3] -eq 0xE0)
+    }
+    return ($b[0] -eq 0x4D -and $b[1] -eq 0x5A)   # "MZ" = Windows executable
+}
+
 function Invoke-Installer {
     param(
         [string]$Source,
@@ -445,9 +472,11 @@ function Invoke-Installer {
         if ($code -eq 1638) { return "a newer version is already installed" }
 
         $last = "exit code $code"
-        # 1619/1620/1639/87/2/1 => the package did not like these switches; the
-        # next set in the list gets a turn. Anything else is a real failure.
-        if ($code -notin @(1, 2, 87, 1619, 1620, 1639)) { break }
+        # These all mean "I do not understand this command line" -- the next set
+        # in the list gets a turn. -536870911 (0xE0000001) is the Advanced
+        # Installer bootstrapper's version of that. Anything else is a real
+        # failure and stops the walk.
+        if ($code -notin @(1, 2, 87, 1619, 1620, 1639, -536870911)) { break }
     }
     throw $last
 }
@@ -493,13 +522,16 @@ function Use-UserHive {
 }
 
 function Read-NewPassword {
-    param([string]$Prompt)
+    param([string]$Prompt, [switch]$AllowEmpty)
     while ($true) {
         $p1 = Read-Host "$Prompt" -AsSecureString
         $p2 = Read-Host "  Confirm password"           -AsSecureString
         $b1 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1))
         $b2 = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2))
-        if ([string]::IsNullOrEmpty($b1)) { Write-Host "  Password cannot be empty. Try again." -ForegroundColor Yellow; continue }
+        if ([string]::IsNullOrEmpty($b1)) {
+            if ($AllowEmpty -and [string]::IsNullOrEmpty($b2)) { return $null }
+            Write-Host "  Password cannot be empty. Try again." -ForegroundColor Yellow; continue
+        }
         if ($b1 -ne $b2)                  { Write-Host "  Passwords did not match. Try again."  -ForegroundColor Yellow; continue }
         return $p1
     }
@@ -581,11 +613,22 @@ Write-Host   ""
 
 # Ask for the admin password only if the admin account doesn't already exist
 # (typed twice, hidden, never written to the log/file)
+$SharedSecurePassword = $null
 if (Get-LocalUser -Name $AdminUser -ErrorAction SilentlyContinue) {
     $AdminSecurePassword = $null
     Write-Host ("  Admin account '{0}' already exists -- keeping its current password." -f $AdminUser) -ForegroundColor Yellow
+
+    # We do not know the existing admin password, so ask for the one to put on
+    # the shared accounts (blank = leave them exactly as they are).
+    $sharedPresent = @($SharedPasswordUsers | Where-Object { $_ -and (Get-LocalUser -Name $_ -ErrorAction SilentlyContinue) })
+    if ($sharedPresent.Count) {
+        Write-Host ("  Local account(s) {0} should share '{1}'s password." -f ($sharedPresent -join ", "), $AdminUser) -ForegroundColor Yellow
+        Write-Host  "  Type that password, or just press Enter twice to leave them untouched." -ForegroundColor DarkGray
+        $SharedSecurePassword = Read-NewPassword ("  Password for " + ($sharedPresent -join ", ")) -AllowEmpty
+    }
 } else {
-    $AdminSecurePassword = Read-NewPassword "  Enter a password for the new admin account '$AdminUser'"
+    $AdminSecurePassword  = Read-NewPassword "  Enter a password for the new admin account '$AdminUser'"
+    $SharedSecurePassword = $AdminSecurePassword
 }
 
 # -----------------------------------------------------------------------------
@@ -699,6 +742,20 @@ Invoke-Step "Apply passwords + never-expires" {
     }
 }
 
+Invoke-Step "Give extra local account(s) the same password as '$AdminUser'" {
+    if (-not $SharedPasswordUsers -or $SharedPasswordUsers.Count -eq 0) { Skip-Step "none configured" }
+    if (-not $SharedSecurePassword) { Skip-Step "no password entered this run -- accounts left untouched" }
+    $done = @()
+    foreach ($u in $SharedPasswordUsers) {
+        if (-not $u -or $u -eq $AdminUser -or $u -eq $DispatcherUser) { continue }
+        if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) { continue }
+        Set-LocalUser -Name $u -Password $SharedSecurePassword -PasswordNeverExpires $true -ErrorAction Stop
+        $done += $u
+    }
+    if (-not $done.Count) { Skip-Step "no such local account on this PC" }
+    "same password as '$AdminUser' applied to: " + ($done -join ", ")
+}
+
 # -----------------------------------------------------------------------------
 # 5. Materialize dispatcher profile on disk (no interactive logon needed)
 # -----------------------------------------------------------------------------
@@ -768,10 +825,41 @@ foreach ($app in $Software) {
             Skip-Step "no installer -- put '$($app.File)' in $InstallersDir or set a Url"
         }
 
+        if (-not (Test-InstallerFile $source $app.Kind)) {
+            throw "'$([IO.Path]::GetFileName($source))' is not a valid $($app.Kind) installer (bad download?)"
+        }
+
         # Install -- silent, hidden, timed out; never waits for input
         Write-Host ("        {0,-22} installing..." -f $app.Name) -ForegroundColor DarkGray
-        Invoke-Installer -Source $source -Kind $app.Kind -ArgSets $app.ArgsList
+        $result = Invoke-Installer -Source $source -Kind $app.Kind -ArgSets $app.ArgsList
+
+        # Nothing is allowed to start running during provisioning -- the apps come
+        # up at the dispatcher's login, not now. Close whatever the installer ran.
+        foreach ($n in @($app.StopAfter)) {
+            if ($n) { Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+        }
+        $result
     }
+}
+
+Invoke-Step "Close anything the installers started" {
+    # Provisioning must not leave programs running -- Jabra Direct, Lexip and Bria
+    # all like to launch themselves at the end of their installer. They come up at
+    # the dispatcher's login instead, from their own logon tasks.
+    $stop = @(
+        'jabra-direct','JabraDirect','JabraChromeHost','JabraSDKService','JabraDeviceService',
+        'lcp','LexipControlSoftware','Lexip',
+        'BriaEnterprise','Bria',
+        'chrome','msedge','GoogleUpdate','OneDrive'
+    )
+    $killed = @()
+    foreach ($n in $stop) {
+        Get-Process -Name $n -ErrorAction SilentlyContinue | ForEach-Object {
+            try { Stop-Process -Id $_.Id -Force -ErrorAction Stop; $killed += $_.ProcessName } catch {}
+        }
+    }
+    if (-not $killed.Count) { "nothing was left running" }
+    else { "closed: " + (($killed | Sort-Object -Unique) -join ", ") }
 }
 
 # -----------------------------------------------------------------------------
@@ -1403,7 +1491,8 @@ function Remove-VendorAutostart {
     $script:_VendorMatch = $Match
     foreach ($k in @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run")) {
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run")) {
         if (-not (Test-Path $k)) { continue }
         $props = Get-ItemProperty -Path $k
         foreach ($p in ($props.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" })) {
@@ -1460,50 +1549,88 @@ Invoke-Step "Install the system-tray launcher helper" {
     $body = @'
 <#
   Start-TrayApp.ps1 -- KJ EMS kiosk
-  Starts an application and parks it in the notification area (system tray):
-  the app runs in the background, its window never greets the dispatcher.
+
+  Starts an application as a background / system-tray app for the dispatcher.
+
+  It is launched through ShellExecute with SW_HIDE so the process never inherits
+  (or opens) a visible console, and then every top-level window the app puts on
+  screen is hidden -- including a console window owned by a conhost.exe child,
+  which is how Jabra Direct's Electron log ends up on the desktop. Each window is
+  hidden only once, so anything the dispatcher opens later from the tray icon
+  stays open.
 #>
 param(
     [Parameter(Mandatory=$true)][string]$Path,
     [string]$Arguments = "",
-    [int]$WaitSec   = 90,
-    [int]$SettleSec = 8
+    [int]$WatchSec = 90
 )
 if (-not (Test-Path $Path)) { exit 1 }
 
-Add-Type -Namespace KJEMS -Name Win -MemberDefinition @"
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public class KJWin {
+    public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+
+    public static IntPtr[] VisibleWindows(int[] pids) {
+        HashSet<uint> want = new HashSet<uint>();
+        foreach (int p in pids) { want.Add((uint)p); }
+        List<IntPtr> hits = new List<IntPtr>();
+        EnumWindows(delegate(IntPtr h, IntPtr l) {
+            if (IsWindowVisible(h)) {
+                uint pid;
+                GetWindowThreadProcessId(h, out pid);
+                if (want.Contains(pid)) { hits.Add(h); }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return hits.ToArray();
+    }
+}
 "@
 
 $SW_HIDE = 0
-$SW_MINIMIZE = 6
-$name = [IO.Path]::GetFileNameWithoutExtension($Path)
+$name    = [IO.Path]::GetFileNameWithoutExtension($Path)
 
-$sp = @{ FilePath = $Path; PassThru = $true; WindowStyle = 'Minimized' }
-if ($Arguments) { $sp.ArgumentList = $Arguments }
-try { $null = Start-Process @sp } catch { exit 1 }
+# ShellExecute + SW_HIDE: no inherited console, no window on screen
+$psi = New-Object Diagnostics.ProcessStartInfo
+$psi.FileName         = $Path
+$psi.Arguments        = $Arguments
+$psi.WorkingDirectory = Split-Path $Path
+$psi.UseShellExecute  = $true
+$psi.WindowStyle      = [Diagnostics.ProcessWindowStyle]::Hidden
+try { $null = [Diagnostics.Process]::Start($psi) } catch { exit 1 }
 
-# As soon as a window appears, minimise it (that is what puts these apps in the tray)
-$sw = [Diagnostics.Stopwatch]::StartNew()
-while ($sw.Elapsed.TotalSeconds -lt $WaitSec) {
-    Start-Sleep -Milliseconds 500
-    $wins = @(Get-Process -Name $name -ErrorAction SilentlyContinue |
-              Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
-    if ($wins.Count -gt 0) {
-        foreach ($w in $wins) { [KJEMS.Win]::ShowWindow($w.MainWindowHandle, $SW_MINIMIZE) | Out-Null }
-        break
+# The app's own processes, plus any console host (conhost.exe) they spawn -- a
+# console window belongs to conhost, not to the app itself.
+function Get-AppPids {
+    $ids = New-Object System.Collections.Generic.List[int]
+    Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object { $ids.Add($_.Id) }
+    if ($ids.Count -gt 0) {
+        Get-CimInstance Win32_Process -Filter "Name='conhost.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $ids -contains [int]$_.ParentProcessId } |
+            ForEach-Object { $ids.Add([int]$_.ProcessId) }
     }
+    return $ids.ToArray()
 }
 
-# Electron/Qt apps like to re-show their window a moment after starting -- give
-# them time to settle, then tuck the window away so only the tray icon is left.
-Start-Sleep -Seconds $SettleSec
-for ($i = 0; $i -lt 3; $i++) {
-    Get-Process -Name $name -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
-        ForEach-Object { [KJEMS.Win]::ShowWindow($_.MainWindowHandle, $SW_HIDE) | Out-Null }
-    Start-Sleep -Seconds 2
+# Keep watching for a while: these apps open their main window and their
+# first-run / onboarding window many seconds apart.
+$seen  = New-Object System.Collections.Generic.HashSet[int64]
+$clock = [Diagnostics.Stopwatch]::StartNew()
+while ($clock.Elapsed.TotalSeconds -lt $WatchSec) {
+    $ids = Get-AppPids
+    if ($ids.Length -gt 0) {
+        foreach ($h in [KJWin]::VisibleWindows($ids)) {
+            if ($seen.Add([int64]$h)) { [void][KJWin]::ShowWindow($h, $SW_HIDE) }
+        }
+    }
+    Start-Sleep -Milliseconds 1000
 }
 exit 0
 '@
