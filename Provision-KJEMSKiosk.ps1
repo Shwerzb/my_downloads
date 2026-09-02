@@ -167,6 +167,7 @@ $ChromeBookmarks = @(
 $DesktopShortcutsToRemove = @(
     "Volume Control", "Microsoft Edge",
     "Adobe", "Acrobat",                       # Acrobat Reader DC & friends
+    "TeamViewer", "AnyDesk", "Radmin", "RustDesk", "UltraViewer", "Supremo",
     "Hatzalah Web", "Team Connect", "Maps", "PCR"
 )
 
@@ -211,7 +212,12 @@ $DispatcherBlockedExes = @(
     "msiexec.exe","winget.exe","AppInstaller.exe","WSReset.exe",
     "certutil.exe","bitsadmin.exe","ftp.exe","tftp.exe","curl.exe",
     # --- accessibility backdoors used to break out of a kiosk ----------------
-    "sethc.exe","utilman.exe","atbroker.exe","DisplaySwitch.exe"
+    "sethc.exe","utilman.exe","atbroker.exe","DisplaySwitch.exe",
+    # --- remote access (ScreenConnect is deliberately NOT here) --------------
+    "TeamViewer.exe","TeamViewer_Service.exe","TeamViewer_Desktop.exe","tv_w32.exe","tv_x64.exe",
+    "AnyDesk.exe","rustdesk.exe","radmin.exe","rserver3.exe","famitrfc.exe",
+    "UltraViewer_Desktop.exe","UltraViewer_Service.exe","AA_v3.exe","Supremo.exe","SupremoService.exe",
+    "vncviewer.exe","winvnc.exe","tvnserver.exe","LogMeIn.exe","SplashtopStreamer.exe","remoting_host.exe"
 )
 
 # ---- Dispatcher blocked Store apps -------------------------------------------
@@ -231,6 +237,21 @@ $DispatcherBlockedAppx = @(
     "Microsoft.WindowsStore","Microsoft.StorePurchaseApp","Microsoft.DesktopAppInstaller",
     "Microsoft.GetHelp","Microsoft.Getstarted","MicrosoftWindows.Client.WebExperience"
 )
+
+# ---- Remote-access tools to REMOVE -------------------------------------------
+# Matched against the installed program name. Every match is uninstalled
+# silently, and the executables are blocked for the dispatcher on top of that.
+# ScreenConnect is protected by name below -- it is how KJ EMS supports the box.
+$RemoteToolsToRemove = @(
+    "TeamViewer",
+    "AnyDesk",
+    "Radmin",        # Famatech Remote Administrator
+    "RustDesk",
+    "UltraViewer", "Ammyy", "Supremo"
+)
+
+# Never uninstalled, whatever the list above matches
+$RemoteToolsKeep = @("ScreenConnect", "Connectwise")
 
 # ---- Software to install ----------------------------------------------------
 # Each entry:
@@ -624,6 +645,54 @@ function Get-UninstallInfo {
     return $null
 }
 
+# Get-UninstallInfo returns the first match; this returns them ALL, across the
+# 64-bit, 32-bit and per-user uninstall keys.
+function Get-UninstallEntries {
+    param([string]$NamePattern)
+    $hits = @()
+    foreach ($k in @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*")) {
+        $hits += Get-ItemProperty $k -ErrorAction SilentlyContinue |
+                 Where-Object { $_.DisplayName -like "*$NamePattern*" }
+    }
+    return $hits
+}
+
+# Splits an UninstallString into the program and its arguments
+function Split-UninstallString {
+    param([string]$Cmd)
+    $Cmd = "$Cmd".Trim()
+    if ($Cmd -match '^"([^"]+)"\s*(.*)$')   { return @($Matches[1], $Matches[2].Trim()) }
+    if ($Cmd -match '^(.+?\.exe)\s*(.*)$')  { return @($Matches[1], $Matches[2].Trim()) }
+    return @($Cmd, "")
+}
+
+# Runs an uninstaller unattended: hidden, timed out, walking a list of silent
+# switches so a UI never opens and nothing waits for a click.
+function Invoke-Uninstaller {
+    param([string]$Exe, [string]$BaseArgs, [string[]]$ExtraArgSets, [int]$TimeoutSec = 180)
+    $last = "no attempt made"
+    foreach ($extra in $ExtraArgSets) {
+        $a = ("$BaseArgs $extra").Trim()
+        $sp = @{ FilePath = $Exe; PassThru = $true; WindowStyle = 'Hidden' }
+        if ($a) { $sp.ArgumentList = $a }
+        try { $p = Start-Process @sp } catch { $last = $_.Exception.Message; continue }
+
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            try { $p.Kill() } catch {}
+            $last = "no response after ${TimeoutSec}s"
+            continue
+        }
+        $code = $p.ExitCode
+        # 1605/1614 = the product is already gone, which is the result we want
+        if ($code -in @(0, 3010, 1641, 1605, 1614)) { return $code }
+        $last = "exit code $code"
+    }
+    throw $last
+}
+
 # Completely remove a local account: the account itself + every profile
 # (incl. orphaned/temp), its ProfileList entry, and its C:\Users folder(s).
 function Remove-UserAndProfiles {
@@ -966,6 +1035,75 @@ Invoke-Step "Close anything the installers started" {
     }
     if (-not $killed.Count) { "nothing was left running" }
     else { "closed: " + (($killed | Sort-Object -Unique) -join ", ") }
+}
+
+Invoke-Step "Uninstall remote-access tools (TeamViewer, AnyDesk, Radmin, RustDesk)" {
+    if (-not $RemoteToolsToRemove -or $RemoteToolsToRemove.Count -eq 0) { Skip-Step "none configured" }
+
+    $removed = @(); $problems = @(); $seen = @()
+    foreach ($name in $RemoteToolsToRemove) {
+        foreach ($e in (Get-UninstallEntries $name)) {
+            $display = "$($e.DisplayName)"
+            if (-not $display) { continue }
+
+            # Never touch our own support tool
+            $keep = $false
+            foreach ($k in $RemoteToolsKeep) { if ($display -like "*$k*") { $keep = $true } }
+            if ($keep) { continue }
+            if ($seen -contains $display) { continue }
+            $seen += $display
+
+            # Stop it before pulling it out from under itself
+            foreach ($pn in @('TeamViewer','TeamViewer_Service','tv_w32','tv_x64','AnyDesk',
+                              'rustdesk','radmin','rserver3','UltraViewer_Desktop','Supremo')) {
+                Get-Process -Name $pn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            }
+
+            $cmd   = if ($e.QuietUninstallString) { "$($e.QuietUninstallString)" } else { "$($e.UninstallString)" }
+            $quiet = [bool]$e.QuietUninstallString
+            if (-not $cmd) { $problems += "$display (no uninstall string)"; continue }
+
+            $parts = Split-UninstallString $cmd
+            $exe   = $parts[0]
+            $uArgs = $parts[1]
+
+            # Put the switch the installer most likely understands first -- a wrong
+            # guess costs a whole timeout while a hidden GUI sits there waiting.
+            #   unins###.exe          -> Inno Setup      -> /VERYSILENT
+            #   already has --remove/--uninstall -> AnyDesk / RustDesk -> --silent
+            #   anything else         -> NSIS (TeamViewer) -> /S
+            $exeLeaf = Split-Path $exe -Leaf
+            if ($exeLeaf -match '^unins\d*\.exe$') {
+                $sets = @('/VERYSILENT /NORESTART /SUPPRESSMSGBOXES', '/SILENT', '/S', '')
+            } elseif ($uArgs -match '--remove|--uninstall') {
+                $sets = @('--silent', '/S', '/quiet', '')
+            } else {
+                $sets = @('/S', '--silent', '/silent', '/quiet', '/VERYSILENT /NORESTART', '')
+            }
+
+            # An MSI product: rewrite /I{GUID} as a silent /X{GUID}
+            if ($uArgs -match '(\{[0-9A-Fa-f\-]{36}\})') {
+                $exe   = "$env:SystemRoot\System32\msiexec.exe"
+                $uArgs = "/x $($Matches[1])"
+                $sets  = @('/qn /norestart', '/quiet /norestart')
+                $quiet = $false
+            }
+            if ($quiet) { $sets = @('') }
+
+            try {
+                Invoke-Uninstaller -Exe $exe -BaseArgs $uArgs -ExtraArgSets $sets | Out-Null
+                $removed += $display
+            } catch {
+                $problems += "$display ($($_.Exception.Message))"
+            }
+        }
+    }
+
+    if (-not $removed.Count -and -not $problems.Count) { Skip-Step "none of them are installed" }
+    $msg = @()
+    if ($removed.Count)  { $msg += "uninstalled: " + ($removed -join ", ") }
+    if ($problems.Count) { $msg += "still present: " + ($problems -join "; ") + " (blocked for the dispatcher regardless)" }
+    $msg -join "  |  "
 }
 
 # -----------------------------------------------------------------------------
