@@ -11,16 +11,19 @@
    5.  Create the dispatcher profile on disk WITHOUT needing an interactive
        logon (Win32 CreateProfile) so per-user settings can be applied in one pass
    6.  Install software (VC++, Chrome, ScreenConnect, Bria, Jabra, Lexip)
+       -- fully unattended: silent switches with fallbacks, hidden windows and a
+       per-installer timeout, so the run NEVER waits for a keypress
    7.  Apply the Chrome kiosk policy (allow/block list, extensions, hardening)
        to the DISPATCHER ONLY  -- the admin keeps a normal Chrome
-   8.  Import Chrome bookmarks
+   8.  Put the EMS links on the Chrome BOOKMARKS BAR (not the desktop)
    9.  Disable Windows 11 widgets, set wallpaper/lock screen
    9b. Block Edge for the dispatcher + kill Microsoft first-login prompts
        ("finish setting up your device", privacy screen, tips, suggested apps)
    10. Disable Google / Edge / OneDrive updaters
    11. Dispatcher desktop lockdown (settings visibility, OneDrive off,
-       recycle bin hidden, volume shortcut, startup programs)
+       recycle bin hidden, clean desktop -- no Volume/Edge/web shortcuts)
    12. Bria auto-launch scheduled task
+   12b Jabra Direct + Lexip Control auto-launch MINIMISED TO THE SYSTEM TRAY
    13. Lexip default-profile cleanup
    14. Print a COLOR-CODED summary of every step (OK / FAIL / SKIP + reason)
 
@@ -135,12 +138,19 @@ $ChromeSitePermissionUrls = @(
     "[*.]teamconnectapp.com"
 )
 
-# Chrome web shortcuts placed on the dispatcher's desktop (name -> URL)
-$DesktopShortcuts = @(
+# EMS links placed on the dispatcher's Chrome BOOKMARKS BAR (name -> URL).
+# These are browser bookmarks -- nothing is put on the Windows desktop.
+$ChromeBookmarks = @(
     @{ Name = "Hatzalah Web"; Url = "https://hatzalahweb.datavanced.com" },
     @{ Name = "Team Connect"; Url = "https://www.teamconnectapp.com" },
     @{ Name = "Maps";         Url = "https://www.google.com/maps" },
     @{ Name = "PCR";          Url = "https://www.creativeemssolutions.com" }   # <-- set your real PCR URL
+)
+
+# Shortcuts that must NOT be on the dispatcher desktop (deleted on every run)
+$DesktopShortcutsToRemove = @(
+    "Volume Control", "Microsoft Edge",
+    "Hatzalah Web", "Team Connect", "Maps", "PCR"
 )
 
 # ---- Dispatcher blocked apps -------------------------------------------------
@@ -165,35 +175,41 @@ $DispatcherBlockedExes = @(
 #   Detect  = text matched against installed program names; if found -> SKIP
 #   Url     = download URL (leave "" to use a local file from .\Installers)
 #   File    = filename in .\Installers  (used when Url is "" OR as download target)
-#   Args    = silent install switches
+#   ArgsList= ordered list of silent-install switch sets. The first set the
+#             package does not reject as an invalid command line is used, so an
+#             installer that wants a different switch style still runs unattended
+#             (nothing ever opens a window or waits for a keypress).
 #   Kind    = 'msi' or 'exe'
 #
 # Apps without a public silent URL (Bria/Jabra/Lexip): drop the installer in the
 # "Installers" folder next to this script using the File name shown, or set Url.
+$MsiSilent = @('/qn /norestart', '/quiet /norestart')
+$ExeSilent = @('/install /quiet /norestart', '/exenoui /qn', '/quiet', '/silent', '/S', '/s')
+
 $Software = @(
     @{ Name='Microsoft Visual C++ 2015-2022 x64'; Detect='Visual C++ 2015-2022 Redistributable (x64)';
        Url='https://aka.ms/vs/17/release/vc_redist.x64.exe'; File='vc_redist.x64.exe';
-       Args='/install /quiet /norestart'; Kind='exe' }
+       ArgsList=@('/install /quiet /norestart'); Kind='exe' }
 
     @{ Name='Google Chrome';                       Detect='Google Chrome';
        Url='https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi'; File='googlechromestandaloneenterprise64.msi';
-       Args='/qn /norestart'; Kind='msi' }
+       ArgsList=$MsiSilent; Kind='msi' }
 
     @{ Name='ScreenConnect (KJEMS)';               Detect='ScreenConnect Client';
        Url='https://kjems.screenconnect.com/Bin/ScreenConnect.ClientSetup.msi?e=Access&y=Guest'; File='screenconnect.msi';
-       Args='/qn /norestart'; Kind='msi' }
+       ArgsList=$MsiSilent; Kind='msi' }
 
     @{ Name='Bria Enterprise';                     Detect='Bria Enterprise';
        Url='https://www.counterpath.com/EnterpriseForWindows'; File='Bria_Enterprise.msi';
-       Args='/qn /norestart'; Kind='msi' }   # 301/302 -> S3 -> Bria_Enterprise_6.8.8_*.msi
+       ArgsList=$MsiSilent; Kind='msi' }   # 301/302 -> S3 -> Bria_Enterprise_6.8.8_*.msi
 
     @{ Name='Jabra Direct';                        Detect='Jabra Direct';
        Url='https://jabraxpressonlineprdstor.blob.core.windows.net/jdo/JabraDirectSetup.exe'; File='JabraDirectSetup.exe';
-       Args='/install /quiet /norestart'; Kind='exe' }   # Advanced Installer pkg; fallback: /exenoui /qn
+       ArgsList=$ExeSilent; Kind='exe' }   # Advanced Installer pkg -- switch set auto-detected
 
     @{ Name='Lexip Control Software 4';            Detect='Lexip Control Software';
        Url='https://lcs.lexip.co/download/lcp/win'; File='lexip_control_software_4.exe';
-       Args='/install /quiet /norestart'; Kind='exe' }   # Advanced Installer pkg; fallback: /exenoui /qn
+       ArgsList=$ExeSilent; Kind='exe' }   # Advanced Installer pkg -- switch set auto-detected
 )
 
 # ---- Paths ------------------------------------------------------------------
@@ -214,6 +230,12 @@ $RemoveLocalGroupPolicy = $true
 # =============================================================================
 
 $ErrorActionPreference = "Stop"
+# No PowerShell progress banner (that is the blue/yellow strip Invoke-WebRequest
+# paints over the top of the console) and never stop to ask a question -- this
+# script must run start to finish without a keypress.
+$ProgressPreference = 'SilentlyContinue'
+$ConfirmPreference  = 'None'
+$WarningPreference  = 'SilentlyContinue'
 if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
 $stamp   = Get-Date -Format "yyyyMMdd_HHmmss"
 $LogFile = Join-Path $LogDir "Provision_$stamp.log"
@@ -268,6 +290,166 @@ function Invoke-Step {
         "FAIL" { Write-Host ("     [FAIL] {0}  -- {1}"  -f $Name, $detail) -ForegroundColor Red }
     }
     $script:Results.Add([pscustomobject]@{ Step=$Name; Status=$status; Detail=$detail; Seconds=$secs })
+}
+
+# ---- Console progress bar ---------------------------------------------------
+# Draws (and re-draws in place) a bar like
+#     Google Chrome  [##############......]  71.4%   82.1 / 115.0 MB  9.8 MB/s
+# The transcript only gets a line per whole percent, so the log stays readable.
+$script:_BarWidth = 30
+$script:_CanRedraw = $true
+try { $null = $Host.UI.RawUI.CursorPosition } catch { $script:_CanRedraw = $false }
+
+function Format-Size {
+    param([double]$Bytes)
+    if ($Bytes -ge 1GB) { return ("{0:0.00} GB" -f ($Bytes / 1GB)) }
+    if ($Bytes -ge 1MB) { return ("{0:0.0} MB"  -f ($Bytes / 1MB)) }
+    if ($Bytes -ge 1KB) { return ("{0:0} KB"    -f ($Bytes / 1KB)) }
+    return ("{0} B" -f [int]$Bytes)
+}
+
+function Write-ProgressBar {
+    param([string]$Label, [double]$Percent, [string]$Right = "", [switch]$Done)
+    if ($Percent -lt 0)   { $Percent = 0 }
+    if ($Percent -gt 100) { $Percent = 100 }
+    $fill = [int][math]::Round($script:_BarWidth * ($Percent / 100))
+    $bar  = ("#" * $fill) + ("." * ($script:_BarWidth - $fill))
+    $text = ("        {0,-22} [{1}] {2,5:0.0}%  {3}" -f $Label, $bar, $Percent, $Right)
+    $color = if ($Done) { "Green" } else { "Cyan" }
+    if ($script:_CanRedraw) {
+        Write-Host ("`r" + $text.PadRight(96)) -NoNewline -ForegroundColor $color
+        if ($Done) { Write-Host "" }
+    } else {
+        Write-Host $text -ForegroundColor $color
+    }
+}
+
+# Marquee for downloads whose size the server does not report
+function Write-SpinBar {
+    param([string]$Label, [int]$Tick, [string]$Right = "")
+    $pos  = $Tick % ($script:_BarWidth - 3)
+    $bar  = ("." * $pos) + "###" + ("." * ($script:_BarWidth - 3 - $pos))
+    $text = ("        {0,-22} [{1}]         {2}" -f $Label, $bar, $Right)
+    if ($script:_CanRedraw) { Write-Host ("`r" + $text.PadRight(96)) -NoNewline -ForegroundColor Cyan }
+    elseif ($Tick % 20 -eq 0) { Write-Host $text -ForegroundColor Cyan }
+}
+
+# Streaming download with the bar above. Writes to <OutFile>.part first so a
+# half-finished file is never mistaken for a good installer.
+function Invoke-Download {
+    param([string]$Url, [string]$OutFile, [string]$Label = "downloading")
+
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+    } catch {}
+
+    $part = "$OutFile.part"
+    Remove-Item $part -Force -ErrorAction SilentlyContinue
+
+    $req = [Net.HttpWebRequest]::Create($Url)
+    $req.UserAgent         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KJEMS-Provision"
+    $req.AllowAutoRedirect = $true
+    $req.Timeout           = 60000
+    $req.ReadWriteTimeout  = 180000
+    $resp = $req.GetResponse()
+    try {
+        $total  = 0
+        try { $total = [int64]$resp.ContentLength } catch {}
+        $in  = $resp.GetResponseStream()
+        $out = [IO.File]::Open($part, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $buf     = New-Object byte[] 262144
+            $got     = [int64]0
+            $lastPct = -1
+            $tick    = 0
+            $clock   = [Diagnostics.Stopwatch]::StartNew()
+            while ($true) {
+                $n = $in.Read($buf, 0, $buf.Length)
+                if ($n -le 0) { break }
+                $out.Write($buf, 0, $n)
+                $got += $n
+                $secs  = [math]::Max($clock.Elapsed.TotalSeconds, 0.001)
+                $speed = Format-Size ($got / $secs)
+                if ($total -gt 0) {
+                    $pct = 100.0 * $got / $total
+                    if ([int]$pct -ne $lastPct) {
+                        $lastPct = [int]$pct
+                        Write-ProgressBar $Label $pct ("{0} / {1}  {2}/s" -f (Format-Size $got), (Format-Size $total), $speed)
+                    }
+                } else {
+                    $tick++
+                    if ($tick % 4 -eq 0) { Write-SpinBar $Label $tick ("{0}  {1}/s" -f (Format-Size $got), $speed) }
+                }
+            }
+            $clock.Stop()
+            Write-ProgressBar $Label 100 ("{0}  done in {1:0}s" -f (Format-Size $got), $clock.Elapsed.TotalSeconds) -Done
+        } finally { $out.Close(); $in.Close() }
+    } finally { $resp.Close() }
+
+    if (-not (Test-Path $part) -or (Get-Item $part).Length -eq 0) { throw "download produced an empty file" }
+    Move-Item $part $OutFile -Force
+    return $OutFile
+}
+
+# Download with a curl.exe fallback (some CDNs behave better with it)
+function Get-Installer {
+    param([string]$Url, [string]$OutFile, [string]$Label)
+    try {
+        return (Invoke-Download -Url $Url -OutFile $OutFile -Label $Label)
+    } catch {
+        $first = $_.Exception.Message
+        Write-Host ("        {0,-22} retrying with curl..." -f $Label) -ForegroundColor DarkGray
+        & curl.exe -sSL --fail --retry 2 -o "$OutFile" "$Url" 2>&1 | Out-Null
+        if ((Test-Path $OutFile) -and (Get-Item $OutFile).Length -gt 0) { return $OutFile }
+        throw "download failed: $first"
+    }
+}
+
+# Runs an installer completely unattended: hidden window, no console inherited,
+# a hard timeout, and a walk through the candidate silent-switch sets so we never
+# fall back to an interactive UI that waits for a click or a keypress.
+function Invoke-Installer {
+    param(
+        [string]$Source,
+        [string]$Kind,
+        [string[]]$ArgSets,
+        [int]$TimeoutSec = 900
+    )
+    if (-not $ArgSets -or $ArgSets.Count -eq 0) { $ArgSets = @('') }
+    $last = "no attempt made"
+
+    foreach ($set in $ArgSets) {
+        if ($Kind -eq 'msi') {
+            $exe = "$env:SystemRoot\System32\msiexec.exe"
+            $arg = ('/i "{0}" {1}' -f $Source, $set).Trim()
+        } else {
+            $exe = $Source
+            $arg = "$set".Trim()
+        }
+
+        $sp = @{ FilePath = $exe; PassThru = $true; WindowStyle = 'Hidden' }
+        if ($arg) { $sp.ArgumentList = $arg }
+        $p = Start-Process @sp
+
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            try { $p.Kill() } catch {}
+            $last = "no response after ${TimeoutSec}s -- installer was killed"
+            continue
+        }
+        $code = $p.ExitCode
+
+        if ($code -eq 0)    { return "" }
+        if ($code -eq 3010) { return "installed (reboot required)" }
+        if ($code -eq 1641) { return "installed (installer requested a reboot)" }
+        if ($code -eq 1638) { return "a newer version is already installed" }
+
+        $last = "exit code $code"
+        # 1619/1620/1639/87/2/1 => the package did not like these switches; the
+        # next set in the list gets a turn. Anything else is a real failure.
+        if ($code -notin @(1, 2, 87, 1619, 1620, 1639)) { break }
+    }
+    throw $last
 }
 
 # ---- Small helpers ----------------------------------------------------------
@@ -580,29 +762,15 @@ foreach ($app in $Software) {
         }
         elseif ($app.Url) {
             $source = Join-Path $env:TEMP $app.File
-            Write-Host "        downloading..." -ForegroundColor DarkGray
-            try {
-                Invoke-WebRequest -Uri $app.Url -OutFile $source -UseBasicParsing -ErrorAction Stop
-            } catch {
-                # fall back to curl.exe (handles some redirects/CDNs better)
-                & curl.exe -L $app.Url -o $source
-                if (-not (Test-Path $source)) { throw "download failed: $($_.Exception.Message)" }
-            }
+            $source = Get-Installer -Url $app.Url -OutFile $source -Label $app.Name
         }
         else {
             Skip-Step "no installer -- put '$($app.File)' in $InstallersDir or set a Url"
         }
 
-        # Install
-        if ($app.Kind -eq 'msi') {
-            $p = Start-Process msiexec.exe -ArgumentList "/i `"$source`" $($app.Args)" -Wait -PassThru
-        } else {
-            $p = Start-Process $source -ArgumentList $app.Args -Wait -PassThru
-        }
-        if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
-            throw "installer exit code $($p.ExitCode)"
-        }
-        if ($p.ExitCode -eq 3010) { "installed (reboot required)" }
+        # Install -- silent, hidden, timed out; never waits for input
+        Write-Host ("        {0,-22} installing..." -f $app.Name) -ForegroundColor DarkGray
+        Invoke-Installer -Source $source -Kind $app.Kind -ArgSets $app.ArgsList
     }
 }
 
@@ -652,6 +820,12 @@ Invoke-Step "Apply Chrome policy to $DispatcherUser" {
         Set-RegValue $base "HomepageLocation"     String $KioskUrl
         Set-RegValue $base "ShowHomeButton"       DWord 1
 
+        # Bookmarks bar: the EMS links live IN the browser, so the bar is always
+        # visible and the dispatcher cannot rename or delete the bookmarks.
+        Set-RegValue $base "BookmarkBarEnabled"            DWord 1
+        Set-RegValue $base "ShowAppsShortcutInBookmarkBar" DWord 0
+        Set-RegValue $base "EditBookmarksEnabled"          DWord 0
+
         # Hardening
         Set-RegValue $base "IncognitoModeAvailability"  DWord 1
         Set-RegValue $base "DeveloperToolsAvailability" DWord 2
@@ -689,6 +863,54 @@ Invoke-Step "Import Chrome bookmarks" {
     if ((Get-FileHash $BookmarksSrc).Hash -ne (Get-FileHash $dest).Hash) { throw "copied bookmarks do not match source" }
 }
 
+Invoke-Step "Put EMS links on the Chrome bookmarks bar" {
+    # These used to be desktop shortcuts. They are now real Chrome bookmarks,
+    # sitting on the bookmarks bar of the dispatcher's Chrome profile.
+    if (-not $ChromeBookmarks -or $ChromeBookmarks.Count -eq 0) { Skip-Step "no bookmarks configured" }
+    if (Test-Path $BookmarksSrc) { Skip-Step "a custom 'Bookmarks' file was imported -- leaving it untouched" }
+    if (-not (Test-Path $DispChromeDef)) { New-Item -Path $DispChromeDef -ItemType Directory -Force | Out-Null }
+
+    function ConvertTo-JsonText { param([string]$Text) ($Text -replace '\\', '\\' ) -replace '"', '\"' }
+
+    # Chrome timestamps: microseconds since 1601-01-01 UTC
+    $epoch = New-Object DateTime(1601, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc))
+    $now   = [long](([datetime]::UtcNow - $epoch).TotalMilliseconds * 1000)
+
+    $kids = @()
+    $id   = 2
+    foreach ($b in $ChromeBookmarks) {
+        if (-not $b.Url) { continue }
+        $kids += ('            {{ "date_added": "{0}", "id": "{1}", "name": "{2}", "type": "url", "url": "{3}" }}' -f `
+                  $now, $id, (ConvertTo-JsonText $b.Name), (ConvertTo-JsonText $b.Url))
+        $id++
+    }
+    if (-not $kids.Count) { Skip-Step "no bookmark URLs configured" }
+
+    $json = @"
+{
+   "roots": {
+      "bookmark_bar": {
+         "children": [
+$($kids -join ",`r`n")
+         ],
+         "date_added": "$now", "date_modified": "$now", "id": "1", "name": "Bookmarks bar", "type": "folder"
+      },
+      "other":  { "children": [], "date_added": "$now", "id": "$id",       "name": "Other bookmarks",  "type": "folder" },
+      "synced": { "children": [], "date_added": "$now", "id": "$($id + 1)", "name": "Mobile bookmarks", "type": "folder" }
+   },
+   "version": 1
+}
+"@
+
+    # Chrome refuses a UTF-8 BOM here, and the stale .bak would be restored over
+    # our file on the next launch -- so write raw UTF-8 and drop the backup.
+    $dest = Join-Path $DispChromeDef "Bookmarks"
+    [IO.File]::WriteAllText($dest, $json, (New-Object Text.UTF8Encoding($false)))
+    Remove-Item (Join-Path $DispChromeDef "Bookmarks.bak") -Force -ErrorAction SilentlyContinue
+
+    "bookmarks bar: " + (($ChromeBookmarks | ForEach-Object { $_.Name }) -join ", ")
+}
+
 # -----------------------------------------------------------------------------
 # 9. Disable Windows 11 widgets
 # -----------------------------------------------------------------------------
@@ -720,12 +942,7 @@ Invoke-Step "Disable Windows 11 widgets" {
 Invoke-Step "Set EMS desktop + lock screen wallpaper" {
     # Download the wallpaper if it isn't sitting next to the script
     if (-not (Test-Path $WallpaperSrc) -and $WallpaperUrl) {
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
-            Invoke-WebRequest -Uri $WallpaperUrl -OutFile $WallpaperSrc -UseBasicParsing -ErrorAction Stop
-        } catch {
-            & curl.exe -L $WallpaperUrl -o $WallpaperSrc 2>$null
-        }
+        try { Get-Installer -Url $WallpaperUrl -OutFile $WallpaperSrc -Label "Wallpaper" | Out-Null } catch {}
     }
     if (-not (Test-Path $WallpaperSrc)) { Skip-Step "wallpaper not found and download failed" }
     Copy-Item $WallpaperSrc $WallpaperDest -Force
@@ -983,52 +1200,41 @@ Invoke-Step "Dispatcher per-user lockdown (settings, OneDrive, recycle bin)" {
     Stop-Process -Name OneDrive -Force -ErrorAction SilentlyContinue
 }
 
-Invoke-Step "Add Volume Control shortcut to dispatcher desktop" {
-    $desktop = Join-Path $DispProfile "Desktop"
-    if (-not (Test-Path $desktop)) { New-Item -Path $desktop -ItemType Directory -Force | Out-Null }
-    $lnk = Join-Path $desktop "Volume Control.lnk"
-    if (Test-Path $lnk) { Skip-Step "already present" }
-    $sh = New-Object -ComObject WScript.Shell
-    $sc = $sh.CreateShortcut($lnk)
-    $sc.TargetPath       = "$env:windir\System32\SndVol.exe"
-    $sc.WorkingDirectory = "$env:windir\System32"
-    $sc.IconLocation     = "$env:windir\System32\SndVol.exe,0"
-    $sc.Description       = "Volume Control"
-    $sc.Save()
-}
+Invoke-Step "Clean dispatcher desktop (no Volume / Edge / web shortcuts)" {
+    # The EMS links are bookmarks inside Chrome now, and the volume flyout on the
+    # taskbar replaces the old SndVol shortcut -- so the desktop stays empty.
+    $desktops = @(
+        (Join-Path $DispProfile "Desktop"),
+        (Join-Path $env:PUBLIC   "Desktop"),
+        "C:\Users\Default\Desktop"
+    ) | Where-Object { Test-Path $_ }
 
-Invoke-Step "Create dispatcher web shortcuts (Hatzalah, Team Connect, Maps, PCR)" {
-    $chrome = @(
-        "C:\Program Files\Google\Chrome\Application\chrome.exe",
-        "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if (-not $chrome) { Skip-Step "Chrome not installed" }
-
-    $desktop = Join-Path $DispProfile "Desktop"
-    if (-not (Test-Path $desktop)) { New-Item -Path $desktop -ItemType Directory -Force | Out-Null }
-
-    $sh = New-Object -ComObject WScript.Shell
-    $made = @()
-    foreach ($s in $DesktopShortcuts) {
-        if (-not $s.Url) { continue }
-        $lnk = Join-Path $desktop ("{0}.lnk" -f $s.Name)
-        $sc = $sh.CreateShortcut($lnk)
-        $sc.TargetPath       = $chrome
-        $sc.Arguments        = ('--new-window "{0}"' -f $s.Url)
-        $sc.WorkingDirectory = Split-Path $chrome
-        $sc.IconLocation     = "$chrome,0"
-        $sc.Description       = $s.Name
-        $sc.Save()
-        $made += $s.Name
+    $removed = @()
+    foreach ($d in $desktops) {
+        foreach ($n in $DesktopShortcutsToRemove) {
+            foreach ($ext in @("lnk", "url")) {
+                Get-ChildItem -Path $d -Filter "$n*.$ext" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                    $removed += $_.Name
+                }
+            }
+        }
     }
-    "created: " + ($made -join ", ")
+
+    # Stop Edge from dropping its desktop icon back on every update
+    $eu = "HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate"
+    Set-RegValue $eu "CreateDesktopShortcutDefault" DWord 0
+    Set-RegValue $eu "RemoveDesktopShortcutDefault" DWord 1
+
+    if (-not $removed.Count) { "desktop already clean" }
+    else { "removed: " + (($removed | Sort-Object -Unique) -join ", ") }
 }
 
-Invoke-Step "Set dispatcher startup apps (Chrome, Lexip)" {
+Invoke-Step "Set dispatcher startup app (Chrome -> Hatzalah Web)" {
     if (-not $DispSid) { throw "dispatcher SID not found" }
-    # Bria starts via its own logon scheduled task (below). Jabra Direct starts
-    # itself in the background/tray via its own installer autostart, so we do NOT
-    # launch its window here.
+    # Chrome is the ONLY thing that opens a window at logon, and it opens straight
+    # onto Hatzalah Web. Bria, Jabra Direct and Lexip Control each start from their
+    # own logon scheduled task -- Jabra and Lexip land in the system tray.
 
     # Chrome exe
     $chrome = @(
@@ -1059,15 +1265,18 @@ Invoke-Step "Set dispatcher startup apps (Chrome, Lexip)" {
         param($root)
         $run = "$root\Software\Microsoft\Windows\CurrentVersion\Run"
         if (-not (Test-Path $run)) { New-Item -Path $run -Force | Out-Null }
-        if ($script:_StartChrome) { Set-RegValue $run "GoogleChrome" String ('"{0}"' -f $script:_StartChrome) }
-        if ($script:_StartLexip)  { Set-RegValue $run "LexipControl" String ('"{0}"' -f $script:_StartLexip) }
-        # Remove any foreground Jabra launcher a previous run added -- Jabra runs
-        # itself in the tray, and this entry was popping its window open.
-        Remove-ItemProperty -Path $run -Name "JabraDirect" -ErrorAction SilentlyContinue
+        if ($script:_StartChrome) {
+            Set-RegValue $run "GoogleChrome" String ('"{0}" --start-maximized "{1}"' -f $script:_StartChrome, $KioskUrl)
+        }
+        # Jabra and Lexip must NOT be in the Run key -- Explorer starts Run-key apps
+        # in the foreground, which is what kept popping their windows open. They are
+        # started minimised to the tray by their own logon tasks instead.
+        Remove-ItemProperty -Path $run -Name "LexipControl" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $run -Name "JabraDirect"  -ErrorAction SilentlyContinue
     }
 
     if (-not $chrome) { throw "Chrome not installed -- cannot start it at login" }
-    if (-not $lexip)  { "Chrome start set; Lexip exe not found (install Lexip first)" }
+    "Chrome starts at logon on $KioskUrl"
 }
 
 Invoke-Step "Pin Chrome + Bria to the taskbar (dispatcher)" {
@@ -1180,6 +1389,174 @@ Invoke-Step "Register Bria logon task for $DispatcherUser" {
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
     Register-ScheduledTask -TaskName "Launch Bria for Dispatcher" -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Force | Out-Null
+}
+
+# -----------------------------------------------------------------------------
+# 12b. Jabra Direct + Lexip Control -- start as BACKGROUND / SYSTEM TRAY apps
+# -----------------------------------------------------------------------------
+Write-Banner "7b. Background (system tray) apps"
+
+# Strips a vendor's own foreground autostart (Run keys + Startup shortcuts) so the
+# tray task below is the only thing that launches the app.
+function Remove-VendorAutostart {
+    param([string]$Match)
+    $script:_VendorMatch = $Match
+    foreach ($k in @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run")) {
+        if (-not (Test-Path $k)) { continue }
+        $props = Get-ItemProperty -Path $k
+        foreach ($p in ($props.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" })) {
+            if ($p.Name -like "*$Match*" -or "$($p.Value)" -like "*$Match*") {
+                Remove-ItemProperty -Path $k -Name $p.Name -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    foreach ($d in @((Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\StartUp"), $DispStartup)) {
+        if ($d -and (Test-Path $d)) {
+            Get-ChildItem -Path $d -Filter "*.lnk" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "*$Match*" } |
+                ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    if ($DispSid) {
+        Use-UserHive -Sid $DispSid -NtUserDat $DispNtUser -Body {
+            param($root)
+            $run = "$root\Software\Microsoft\Windows\CurrentVersion\Run"
+            if (Test-Path $run) {
+                $props = Get-ItemProperty -Path $run
+                foreach ($p in ($props.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" })) {
+                    if ($p.Name -like "*$($script:_VendorMatch)*" -or "$($p.Value)" -like "*$($script:_VendorMatch)*") {
+                        Remove-ItemProperty -Path $run -Name $p.Name -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+    }
+}
+
+# Logon task that runs the tray launcher. A scheduled task is used (not the Run
+# key) because the Task Scheduler service is not subject to the dispatcher's
+# DisallowRun policy, and because it can run completely hidden.
+function Register-TrayAppTask {
+    param([string]$TaskName, [string]$Exe, [string]$Arguments = "", [string]$Delay = "PT25S")
+    $helper = Join-Path $LogDir "Start-TrayApp.ps1"
+    $psExe  = Join-Path $PSHOME "powershell.exe"
+    $a = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Path "{1}"' -f $helper, $Exe
+    if ($Arguments) { $a += (' -Arguments "{0}"' -f $Arguments) }
+
+    $action    = New-ScheduledTaskAction -Execute $psExe -Argument $a
+    $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $DispatcherUser
+    $trigger.Delay = $Delay
+    $principal = New-ScheduledTaskPrincipal -UserId $DispatcherUser -LogonType Interactive -RunLevel Limited
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                    -StartWhenAvailable -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Force | Out-Null
+}
+
+Invoke-Step "Install the system-tray launcher helper" {
+    $helper = Join-Path $LogDir "Start-TrayApp.ps1"
+    $body = @'
+<#
+  Start-TrayApp.ps1 -- KJ EMS kiosk
+  Starts an application and parks it in the notification area (system tray):
+  the app runs in the background, its window never greets the dispatcher.
+#>
+param(
+    [Parameter(Mandatory=$true)][string]$Path,
+    [string]$Arguments = "",
+    [int]$WaitSec   = 90,
+    [int]$SettleSec = 8
+)
+if (-not (Test-Path $Path)) { exit 1 }
+
+Add-Type -Namespace KJEMS -Name Win -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+"@
+
+$SW_HIDE = 0
+$SW_MINIMIZE = 6
+$name = [IO.Path]::GetFileNameWithoutExtension($Path)
+
+$sp = @{ FilePath = $Path; PassThru = $true; WindowStyle = 'Minimized' }
+if ($Arguments) { $sp.ArgumentList = $Arguments }
+try { $null = Start-Process @sp } catch { exit 1 }
+
+# As soon as a window appears, minimise it (that is what puts these apps in the tray)
+$sw = [Diagnostics.Stopwatch]::StartNew()
+while ($sw.Elapsed.TotalSeconds -lt $WaitSec) {
+    Start-Sleep -Milliseconds 500
+    $wins = @(Get-Process -Name $name -ErrorAction SilentlyContinue |
+              Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
+    if ($wins.Count -gt 0) {
+        foreach ($w in $wins) { [KJEMS.Win]::ShowWindow($w.MainWindowHandle, $SW_MINIMIZE) | Out-Null }
+        break
+    }
+}
+
+# Electron/Qt apps like to re-show their window a moment after starting -- give
+# them time to settle, then tuck the window away so only the tray icon is left.
+Start-Sleep -Seconds $SettleSec
+for ($i = 0; $i -lt 3; $i++) {
+    Get-Process -Name $name -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
+        ForEach-Object { [KJEMS.Win]::ShowWindow($_.MainWindowHandle, $SW_HIDE) | Out-Null }
+    Start-Sleep -Seconds 2
+}
+exit 0
+'@
+    Set-Content -Path $helper -Value $body -Encoding UTF8 -Force
+    "helper: $helper"
+}
+
+Invoke-Step "Jabra Direct: start in the system tray at logon" {
+    $jabra = @(
+        "C:\Program Files (x86)\Jabra\Direct6\jabra-direct.exe",
+        "C:\Program Files\Jabra\Direct6\jabra-direct.exe",
+        "C:\Program Files (x86)\Jabra\Direct\jabra-direct.exe",
+        "C:\Program Files\Jabra\Direct\jabra-direct.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    if (-not $jabra) {
+        foreach ($root in @("C:\Program Files (x86)\Jabra", "C:\Program Files\Jabra")) {
+            if (-not (Test-Path $root)) { continue }
+            $jabra = Get-ChildItem $root -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -match 'jabra[- ]?direct\.exe$' } |
+                     Select-Object -First 1 -ExpandProperty FullName
+            if ($jabra) { break }
+        }
+    }
+    if (-not $jabra) {
+        $info = Get-UninstallInfo "Jabra Direct"
+        if ($info -and $info.InstallLocation -and (Test-Path $info.InstallLocation)) {
+            $jabra = Get-ChildItem $info.InstallLocation -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -match 'jabra' -and $_.Name -notmatch 'updat|uninst|crash|report|setup' } |
+                     Select-Object -First 1 -ExpandProperty FullName
+        }
+    }
+    if (-not $jabra) { Skip-Step "Jabra Direct not installed yet" }
+
+    Remove-VendorAutostart -Match "jabra"
+    Register-TrayAppTask -TaskName "KJEMS Jabra Direct (tray)" -Exe $jabra -Delay "PT25S"
+    "tray launch: $jabra"
+}
+
+Invoke-Step "Lexip Control: start in the system tray at logon" {
+    $lexip = $script:_StartLexip
+    if (-not $lexip) {
+        $info = Get-UninstallInfo "Lexip Control Software"
+        if ($info -and $info.InstallLocation -and (Test-Path $info.InstallLocation)) {
+            $lexip = Get-ChildItem $info.InstallLocation -Filter "lcp.exe" -Recurse -ErrorAction SilentlyContinue |
+                     Select-Object -First 1 -ExpandProperty FullName
+        }
+    }
+    if (-not $lexip) { Skip-Step "Lexip Control Software not installed yet" }
+
+    Remove-VendorAutostart -Match "lexip"
+    Register-TrayAppTask -TaskName "KJEMS Lexip Control (tray)" -Exe $lexip -Delay "PT35S"
+    "tray launch: $lexip"
 }
 
 # -----------------------------------------------------------------------------
