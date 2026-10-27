@@ -108,38 +108,48 @@ $ChromeStartupSites = @(
     $KioskUrl
 )
 
+# Chrome's URL filter format is:  [scheme://][.]host[:port][/path][@query]
+#
+#   * a BARE host matches that host AND all of its subdomains, on any scheme,
+#     any port and any path -- that is the form you want nearly always
+#   * a LEADING DOT (".host") means that exact host ONLY, no subdomains
+#   * "*" on its own matches everything
+#   * there is NO "*.host" wildcard. A host containing "*" is not a valid
+#     hostname, so the rule is parsed but can never match a real URL.
+#   * the path is matched as a PREFIX, so a trailing "/*" is taken literally
+#     and only matches URLs whose path really begins with "/*"
+#
+# Both "*.host/*" and "host/*" therefore silently match nothing. That is how
+# 7831212.com, 7830112.com and screenconnect.com ended up blocked by the
+# catch-all rule, and why extension updates (clients2.google.com) never got
+# through either -- every one of them was listed only in a dead form.
+# Verified against components/url_matcher/url_util.cc (FilterToComponents /
+# CreateConditionSet) and its unit tests.
 $ChromeAllowedSites = @(
-    "https://hatzalahweb.datavanced.com/*",
-    "chrome-extension://mhepdhfghgjcpkkcaeajofhgknanaopl/*",
-    "chrome-extension://hdhinadidafjejdhmfkjgnolgimiaplp/*",
-    "https://clients2.google.com/*",
-    "https://clients4.google.com/*",
-    "https://clients5.google.com/*",
-    "https://clients6.google.com/*",
-    "https://chrome.google.com/*",
-    "https://chromewebstore.google.com/*",
-    "https://*.googleusercontent.com/*",
-    "https://*.gstatic.com/*",
-    "https://www.google.com/maps",
-    "hatzalahweb.datavanced.com",
-    "*.creativeemssolutions.com/*",
-    "*.creativeems.com/*",
-    "https://www.teamconnectapp.com/*",
+    # --- EMS systems -------------------------------------------------------
+    "datavanced.com",            # includes hatzalahweb.datavanced.com
     "teamconnectapp.com",
     "creativeemssolutions.com",
     "creativeems.com",
-    "*.datavanced.com/*",
-    "*.teamconnectapp.com/*",
-    "*.screenconnect.com/*",
-    "*.7831212.com/*",
-    "*.7830112.com/*",
-    "https://cloud.samsara.com/*",
+    "7831212.com",
+    "7830112.com",
     "cloud.samsara.com",
+    "screenconnect.com",         # KJ EMS remote support
+
+    # --- Maps --------------------------------------------------------------
     "google.com/maps",
     "maps.google.com",
-    "http://maps.google.com/*",
-    "*.google.com/maps/*"
-)
+
+    # --- Chrome extension install/update + browser UI assets ---------------
+    "clients2.google.com",
+    "clients4.google.com",
+    "clients5.google.com",
+    "clients6.google.com",
+    "chrome.google.com",
+    "chromewebstore.google.com",
+    "googleusercontent.com",
+    "gstatic.com"
+) + ($ChromeExtensionIds | ForEach-Object { "chrome-extension://$_" })
 
 # Default page zoom for the dispatcher's Chrome, in percent. Chrome's own preset
 # steps are 25 33 50 67 75 80 90 100 110 125 150 175 200 ...; 100 = no zoom.
